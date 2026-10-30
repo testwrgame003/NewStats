@@ -32,19 +32,19 @@ const GROUP_CONFIG = {
     label: "Trainer",
     color: 0x2ecc71,
     heartbeatChannelId: "1486243169422020648",
-    panelChannelId: "1490581093429280808"
+    panelChannelId: "1564890852310913034"
   },
   Gym_Leader: {
     label: "Gym Leader",
     color: 0x3498db,
     heartbeatChannelId: "1491238609578360833",
-    panelChannelId: "1495594175058673736"
+    panelChannelId: "1564890852310913034"
   },
   Elite_Four: {
     label: "Elite Four",
     color: 0x9b59b6,
     heartbeatChannelId: "1483616146996465735",
-    panelChannelId: "1488126321786753156"
+    panelChannelId: "1564890852310913034"
   }
 };
 
