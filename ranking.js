@@ -1,26 +1,20 @@
-const { AttachmentBuilder } = require("discord.js");
-const { createCanvas, registerFont } = require("canvas");
-const path = require("path");
-const fs = require("fs");
-
-// Intentar registrar la fuente Righteous si existe en el repositorio
-const fontPath = path.join(process.cwd(), "assets/fonts/Righteous-Regular.ttf");
-if (fs.existsSync(fontPath)) {
-  try {
-    registerFont(fontPath, { family: "Righteous" });
-  } catch {}
-}
+const {
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  MessageFlags
+} = require("discord.js");
 
 const RANKING_CHANNEL_ID = process.env.RANKING_CHANNEL_ID;
 const RIVALS_SESSIONS_KEY = "rivals_sessions";
 
-// Configuración de XP y Niveles
 const BASE_XP_PER_MINUTE = 0.25;
 const XP_PER_GP_BONUS = 175;
 const XP_PER_LEVEL = 250;
 
-const TRACKING_CYCLE_MS = 5 * 60 * 1000;   // Cada 5 min actualiza progreso en vivo
-const RANKING_RENDER_MS = 20 * 60 * 1000;  // Cada 20 min redibuja el tablero en Discord
+const TRACKING_CYCLE_MS = 5 * 60 * 1000;
+const RANKING_UPDATE_MS = 15 * 60 * 1000;
 
 function safeParse(data, fallback = {}) {
   try {
@@ -40,9 +34,20 @@ function getUserLevel(totalXP) {
   return Math.floor((Number(totalXP) || 0) / XP_PER_LEVEL) + 1;
 }
 
-function getLevelProgressRatio(totalXP) {
+function buildXpBar(totalXP, size = 8) {
   const intoLevel = (Number(totalXP) || 0) % XP_PER_LEVEL;
-  return Math.min(Math.max(intoLevel / XP_PER_LEVEL, 0), 1);
+  const ratio = Math.min(Math.max(intoLevel / XP_PER_LEVEL, 0), 1);
+  const filled = Math.round(ratio * size);
+  return "▰".repeat(filled) + "▱".repeat(size - filled);
+}
+
+function getRankTitle(level) {
+  if (level >= 50) return "👑 Grand Master";
+  if (level >= 35) return "💎 Mythic Reroller";
+  if (level >= 25) return "🔥 Legend";
+  if (level >= 15) return "⚡ Veteran";
+  if (level >= 8) return "🌟 Striker";
+  return "🌱 Challenger";
 }
 
 function formatCompactNumber(value) {
@@ -65,8 +70,9 @@ module.exports = (client, options) => {
   let trackingData = {};
   let liveSessions = {};
   let rankingMsgId = null;
+  let currentSortBy = "xp"; // "xp" | "gp" | "packs"
   let lastCycleTs = Date.now();
-  let lastRenderTs = 0;
+  let lastUpdateTs = 0;
 
   async function loadAllRegisteredUsers() {
     const allUsers = {};
@@ -110,7 +116,6 @@ module.exports = (client, options) => {
       }
     }
 
-    // Incluir también miembros dentro de sesiones activas de Rivals
     const rivalsRaw = await redis.hgetall(RIVALS_SESSIONS_KEY).catch(() => ({}));
     if (rivalsRaw && typeof rivalsRaw === "object") {
       for (const raw of Object.values(rivalsRaw)) {
@@ -136,7 +141,6 @@ module.exports = (client, options) => {
       const onlineDiscordSet = await loadAllOnlineDiscordIds(idToDiscordMap);
       const gpUsersRaw = await redis.hgetall("gp_users").catch(() => ({}));
 
-      // 1. Sincronizar God Packs desde Redis
       if (gpUsersRaw && typeof gpUsersRaw === "object") {
         for (const [discordId, rawGp] of Object.entries(gpUsersRaw)) {
           const parsedGp = safeParse(rawGp, {});
@@ -157,7 +161,6 @@ module.exports = (client, options) => {
         }
       }
 
-      // 2. Sumar XP y Tiempo a los usuarios actualmente Online
       for (const discordId of onlineDiscordSet) {
         const u = allUsers[discordId];
         if (!u) continue;
@@ -181,7 +184,6 @@ module.exports = (client, options) => {
         liveSessions[discordId].sessionXP += (BASE_XP_PER_MINUTE / 60) * elapsedSeconds;
       }
 
-      // 3. Consolidar sesiones de usuarios que se desconectaron
       for (const discordId of Object.keys(liveSessions)) {
         if (!onlineDiscordSet.has(discordId)) {
           const sess = liveSessions[discordId];
@@ -196,16 +198,16 @@ module.exports = (client, options) => {
 
       await redis.set("tracking_data", JSON.stringify(trackingData));
 
-      if (now - lastRenderTs >= RANKING_RENDER_MS) {
-        lastRenderTs = now;
+      if (now - lastUpdateTs >= RANKING_UPDATE_MS) {
+        lastUpdateTs = now;
         await updateGeneralRankingBoard(allUsers, onlineDiscordSet);
       }
     } catch (err) {
-      console.error("❌ Error en syncTrackingCycle (ranking.js):", err);
+      console.error("❌ Error in syncTrackingCycle (ranking.js):", err);
     }
   }
 
-  async function buildUnifiedRankingRows(allUsers, onlineDiscordSet) {
+  async function buildUnifiedRankingRows(allUsers, onlineDiscordSet, sortBy = "xp") {
     const rows = [];
     const allIds = new Set([...Object.keys(allUsers), ...Object.keys(trackingData)]);
 
@@ -222,11 +224,14 @@ module.exports = (client, options) => {
 
       if (totalXP <= 0 && gpCount <= 0 && totalMinutes <= 0) continue;
 
+      const level = getUserLevel(totalXP);
+
       rows.push({
         id: discordId,
         name: u.name || t.name || "Unknown",
-        level: getUserLevel(totalXP),
-        progress: getLevelProgressRatio(totalXP),
+        level,
+        title: getRankTitle(level),
+        xpBar: buildXpBar(totalXP, 8),
         xp: totalXP,
         gp: gpCount,
         time: totalMinutes,
@@ -236,137 +241,92 @@ module.exports = (client, options) => {
       });
     }
 
+    if (sortBy === "gp") {
+      return rows.sort((a, b) => b.gp - a.gp || b.xp - a.xp || b.time - a.time);
+    }
+    if (sortBy === "packs") {
+      return rows.sort((a, b) => b.packs - a.packs || b.xp - a.xp || b.gp - a.gp);
+    }
     return rows.sort((a, b) => b.xp - a.xp || b.gp - a.gp || b.time - a.time);
   }
 
-  async function renderGeneralRankingCanvas(rows) {
-    const width = 1000;
-    const height = 1340;
-    const headerHeight = 165;
-    const rowHeight = 74;
-    const shown = rows.slice(0, 15);
+  function buildInteractiveLeaderboardPayload(rows, sortBy = "xp") {
+    const totalGP = rows.reduce((acc, r) => acc + r.gp, 0);
+    const totalPacks = rows.reduce((acc, r) => acc + r.packs, 0);
+    const onlineCount = rows.filter((r) => r.isOnline).length;
 
-    const canvas = createCanvas(width, height);
-    const ctx = canvas.getContext("2d");
+    const sortLabel =
+      sortBy === "gp"
+        ? "🌟 Sorted by God Packs Found"
+        : sortBy === "packs"
+        ? "🀄 Sorted by Total Packs Opened"
+        : "✨ Sorted by Total XP & Level";
 
-    // 1. Fondo degradado espacial profundo
-    const bgGrad = ctx.createLinearGradient(0, 0, width, height);
-    bgGrad.addColorStop(0, "#0b1120");
-    bgGrad.addColorStop(0.5, "#0f172a");
-    bgGrad.addColorStop(1, "#020617");
-    ctx.fillStyle = bgGrad;
-    ctx.fillRect(0, 0, width, height);
-
-    // 2. Cabecera dorada/cian
-    ctx.fillStyle = "rgba(255, 255, 255, 0.04)";
-    ctx.fillRect(0, 0, width, headerHeight);
-
-    ctx.fillStyle = "#ffd700";
-    ctx.font = "bold 44px Righteous, sans-serif";
-    ctx.fillText("ZENITH REROLL — GLOBAL HALL OF FAME", 45, 70);
-
-    ctx.fillStyle = "#94a3b8";
-    ctx.font = "22px Righteous, sans-serif";
-    ctx.fillText("Unified General Leaderboard  •  Sorted by Total XP & God Packs", 47, 112);
-
-    const lineGrad = ctx.createLinearGradient(45, 0, width - 45, 0);
-    lineGrad.addColorStop(0, "#ffd700");
-    lineGrad.addColorStop(0.5, "#00f2fe");
-    lineGrad.addColorStop(1, "#a855f7");
-    ctx.fillStyle = lineGrad;
-    ctx.fillRect(45, 135, width - 90, 4);
-
-    if (shown.length === 0) {
-      ctx.fillStyle = "#ffffff";
-      ctx.font = "28px Righteous, sans-serif";
-      ctx.fillText("No ranking data available yet.", 45, 230);
-      return new AttachmentBuilder(canvas.toBuffer("image/png"), { name: "zenith-global-ranking.png" });
-    }
-
-    // 3. Dibujar filas del Top 15
-    for (let i = 0; i < shown.length; i++) {
-      const user = shown[i];
-      const y = headerHeight + 12 + i * rowHeight;
-
-      // Fondo de tarjeta por fila (destacando el Top 3)
-      if (i === 0) ctx.fillStyle = "rgba(255, 215, 0, 0.13)";
-      else if (i === 1) ctx.fillStyle = "rgba(226, 232, 240, 0.10)";
-      else if (i === 2) ctx.fillStyle = "rgba(249, 115, 22, 0.10)";
-      else ctx.fillStyle = i % 2 === 0 ? "rgba(255, 255, 255, 0.045)" : "rgba(255, 255, 255, 0.02)";
-
-      ctx.fillRect(35, y, width - 70, rowHeight - 8);
-
-      // Barra lateral de color para el Top 3
-      if (i < 3) {
-        ctx.fillStyle = i === 0 ? "#ffd700" : i === 1 ? "#e2e8f0" : "#f97316";
-        ctx.fillRect(35, y, 6, rowHeight - 8);
-      }
-
-      // Posición (#1, #2, #3...)
-      ctx.fillStyle = i === 0 ? "#ffd700" : i === 1 ? "#e2e8f0" : i === 2 ? "#fb923c" : "#64748b";
-      ctx.font = "bold 30px Righteous, sans-serif";
-      ctx.fillText(`#${i + 1}`, 58, y + 44);
-
-      // Indicador Online + Nombre del Jugador
-      ctx.fillStyle = user.isOnline ? "#10b981" : "#475569";
-      ctx.beginPath();
-      ctx.arc(135, y + 26, 6, 0, Math.PI * 2);
-      ctx.fill();
-
-      ctx.fillStyle = "#ffffff";
-      ctx.font = "bold 26px Righteous, sans-serif";
-      ctx.fillText(String(user.name).slice(0, 18), 152, y + 34);
-
-      // Barra de progreso hacia el siguiente nivel debajo del nombre
-      const barX = 152;
-      const barY = y + 46;
-      const barW = 210;
-      const barH = 8;
-      ctx.fillStyle = "rgba(255, 255, 255, 0.12)";
-      ctx.fillRect(barX, barY, barW, barH);
-      ctx.fillStyle = "#00f2fe";
-      ctx.fillRect(barX, barY, Math.round(barW * user.progress), barH);
-
-      // Nivel y XP
-      ctx.fillStyle = "#00f2fe";
-      ctx.font = "bold 24px Righteous, sans-serif";
-      ctx.fillText(`Lv. ${user.level}`, 420, y + 34);
-
-      ctx.fillStyle = "#94a3b8";
-      ctx.font = "17px Righteous, sans-serif";
-      ctx.fillText(`${formatCompactNumber(user.xp)} XP`, 420, y + 56);
-
-      // God Packs
-      ctx.fillStyle = "#ffd700";
-      ctx.font = "bold 24px Righteous, sans-serif";
-      ctx.fillText(`★ ${user.gp} GP`, 575, y + 34);
-
-      ctx.fillStyle = "#94a3b8";
-      ctx.font = "17px Righteous, sans-serif";
-      ctx.fillText(`${formatCompactNumber(user.packs)} packs`, 575, y + 56);
-
-      // Tiempo Online Acumulado
-      ctx.fillStyle = "#f8fafc";
-      ctx.font = "bold 22px Righteous, sans-serif";
-      ctx.fillText(`${formatDurationCompact(user.time)}`, 745, y + 34);
-
-      ctx.fillStyle = "#94a3b8";
-      ctx.font = "16px Righteous, sans-serif";
-      ctx.fillText("online time", 745, y + 56);
-
-      // Récord de Instancias
-      ctx.fillStyle = "#c084fc";
-      ctx.font = "bold 22px Righteous, sans-serif";
-      ctx.fillText(`x${user.instances}`, 885, y + 34);
-
-      ctx.fillStyle = "#94a3b8";
-      ctx.font = "16px Righteous, sans-serif";
-      ctx.fillText("max inst", 885, y + 56);
-    }
-
-    return new AttachmentBuilder(canvas.toBuffer("image/png"), {
-      name: "zenith-global-ranking.png"
+    // Top 3 Podium Cards
+    const podiumMedals = ["🥇 **1ST PLACE**", "🥈 **2ND PLACE**", "🥉 **3RD PLACE**"];
+    const podiumFields = rows.slice(0, 3).map((u, idx) => {
+      const statusDot = u.isOnline ? "🟢" : "⚫";
+      return {
+        name: `${podiumMedals[idx]} — ${statusDot} ${u.name}`,
+        value:
+          `> 🎖️ **Lv. ${u.level}** (${u.title})\n` +
+          `> \`[${u.xpBar}]\` **${formatCompactNumber(u.xp)} XP**\n` +
+          `> 🌟 **${u.gp} GP**  •  🀄 **${formatCompactNumber(u.packs)}**  •  ⏱️ **${formatDurationCompact(u.time)}**`,
+        inline: true
+      };
     });
+
+    // Ranks #4 to #15
+    const challengers = rows.slice(3, 15).map((u, idx) => {
+      const rankNum = String(idx + 4).padStart(2, "0");
+      const statusDot = u.isOnline ? "🟢" : "⚫";
+      return (
+        `\`#${rankNum}\` ${statusDot} **${u.name}** — **Lv.${u.level}** \`[${u.xpBar}]\`\n` +
+        `┗ ✨ \`${formatCompactNumber(u.xp)} XP\`  •  🌟 \`${u.gp} GP\`  •  🀄 \`${formatCompactNumber(u.packs)}\`  •  ⏱️ \`${formatDurationCompact(u.time)}\`  •  🖥️ \`x${u.instances}\``
+      );
+    });
+
+    const embed = new EmbedBuilder()
+      .setColor(sortBy === "gp" ? 0xffd700 : sortBy === "packs" ? 0x00f2fe : 0x9b59b6)
+      .setTitle("🏆 ZENITH REROLL — GLOBAL HALL OF FAME")
+      .setDescription(
+        `> 🌐 **Global Community Stats:** \`${rows.length} Ranked Players\`  •  🟢 \`${onlineCount} Online\`  •  🌟 \`${totalGP} Total GPs\`  •  🀄 \`${formatCompactNumber(totalPacks)} Packs\`\n` +
+        `> 📊 **Current View:** **${sortLabel}**\n` +
+        `───────────────────────────────────────────────`
+      )
+      .addFields(...podiumFields)
+      .addFields({
+        name: "⚔️ TOP CHALLENGERS (#04 — #15)",
+        value: challengers.length > 0 ? challengers.join("\n\n").slice(0, 1020) : "*Waiting for more challengers...*",
+        inline: false
+      })
+      .setFooter({ text: "Use the buttons below to switch sorting or inspect your personal rank card!" })
+      .setTimestamp();
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("rank_sort_xp")
+        .setLabel("Sort by XP")
+        .setEmoji("✨")
+        .setStyle(sortBy === "xp" ? ButtonStyle.Primary : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("rank_sort_gp")
+        .setLabel("Sort by God Packs")
+        .setEmoji("🌟")
+        .setStyle(sortBy === "gp" ? ButtonStyle.Primary : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("rank_sort_packs")
+        .setLabel("Sort by Packs")
+        .setEmoji("🀄")
+        .setStyle(sortBy === "packs" ? ButtonStyle.Primary : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId("rank_my_stats")
+        .setLabel("My Rank Card")
+        .setEmoji("👤")
+        .setStyle(ButtonStyle.Success)
+    );
+
+    return { embeds: [embed], components: [row] };
   }
 
   async function updateGeneralRankingBoard(allUsersCache = null, onlineSetCache = null) {
@@ -380,8 +340,8 @@ module.exports = (client, options) => {
         : await loadAllRegisteredUsers();
 
       const onlineSet = onlineSetCache || (await loadAllOnlineDiscordIds(idToDiscordMap));
-      const rows = await buildUnifiedRankingRows(allUsers, onlineSet);
-      const attachment = await renderGeneralRankingCanvas(rows);
+      const rows = await buildUnifiedRankingRows(allUsers, onlineSet, currentSortBy);
+      const payload = buildInteractiveLeaderboardPayload(rows, currentSortBy);
 
       let msg = null;
       if (rankingMsgId) {
@@ -390,17 +350,15 @@ module.exports = (client, options) => {
 
       if (!msg) {
         const recent = await channel.messages.fetch({ limit: 20 }).catch(() => null);
-        msg = recent?.find((m) => m.author.id === client.user.id && m.attachments.size > 0);
+        msg = recent?.find(
+          (m) =>
+            m.author.id === client.user.id &&
+            m.embeds[0]?.title?.includes("GLOBAL HALL OF FAME")
+        );
       }
 
-      const payload = {
-        content: "🏆 **ZENITH REROLL — RANKING GENERAL UNIFICADO**",
-        files: [attachment],
-        attachments: []
-      };
-
       if (msg) {
-        await msg.edit(payload).catch(() => {});
+        await msg.edit({ content: "", ...payload, files: [], attachments: [] }).catch(() => {});
         rankingMsgId = msg.id;
       } else {
         const sent = await channel.send(payload).catch(() => null);
@@ -411,7 +369,7 @@ module.exports = (client, options) => {
       settings.unifiedRankingMessageId = rankingMsgId;
       await redis.set("panel_settings", JSON.stringify(settings));
     } catch (err) {
-      console.error("❌ Error actualizando el Ranking General:", err);
+      console.error("❌ Error updating General Ranking:", err);
     }
   }
 
@@ -426,7 +384,65 @@ module.exports = (client, options) => {
     setInterval(syncTrackingCycle, TRACKING_CYCLE_MS);
   });
 
-  // Comandos rápidos de administración del Ranking
+  // Interactive Buttons for Sorting & Personal Rank Card
+  client.on("interactionCreate", async (interaction) => {
+    try {
+      if (!interaction.isButton()) return;
+      const { customId } = interaction;
+      if (!customId.startsWith("rank_")) return;
+
+      const { allUsers, idToDiscordMap } = await loadAllRegisteredUsers();
+      const onlineSet = await loadAllOnlineDiscordIds(idToDiscordMap);
+
+      if (customId === "rank_my_stats") {
+        const rows = await buildUnifiedRankingRows(allUsers, onlineSet, "xp");
+        const index = rows.findIndex((r) => String(r.id) === String(interaction.user.id));
+
+        if (index === -1) {
+          return interaction.reply({
+            content: "📭 You don't have recorded ranking stats yet. Go online and start rerolling!",
+            flags: MessageFlags.Ephemeral
+          });
+        }
+
+        const me = rows[index];
+        const nextLevelXP = me.level * XP_PER_LEVEL;
+        const neededXP = Math.max(0, nextLevelXP - me.xp);
+
+        const myEmbed = new EmbedBuilder()
+          .setColor(0x00f2fe)
+          .setTitle(`👤 PERSONAL RANK CARD — ${me.name}`)
+          .setDescription(
+            `> 🏆 **Global Rank:** \`#${index + 1} of ${rows.length}\`\n` +
+            `> 🎖️ **Level ${me.level}** — **${me.title}**\n` +
+            `> \`[${me.xpBar}]\` *(Needs **${neededXP} XP** for Lv. ${me.level + 1})*`
+          )
+          .addFields(
+            { name: "✨ Total XP", value: `\`${me.xp.toLocaleString()} XP\``, inline: true },
+            { name: "🌟 God Packs", value: `\`${me.gp} GP\``, inline: true },
+            { name: "🀄 Total Packs", value: `\`${me.packs.toLocaleString()}\``, inline: true },
+            { name: "⏱️ Online Time", value: `\`${formatDurationCompact(me.time)}\``, inline: true },
+            { name: "🖥️ Max Instances", value: `\`x${me.instances}\``, inline: true },
+            { name: "📡 Current Status", value: me.isOnline ? "🟢 **ONLINE**" : "⚫ **OFFLINE**", inline: true }
+          )
+          .setTimestamp();
+
+        return interaction.reply({ embeds: [myEmbed], flags: MessageFlags.Ephemeral });
+      }
+
+      if (customId === "rank_sort_xp") currentSortBy = "xp";
+      else if (customId === "rank_sort_gp") currentSortBy = "gp";
+      else if (customId === "rank_sort_packs") currentSortBy = "packs";
+
+      const rows = await buildUnifiedRankingRows(allUsers, onlineSet, currentSortBy);
+      const payload = buildInteractiveLeaderboardPayload(rows, currentSortBy);
+      await interaction.update(payload);
+    } catch (err) {
+      console.error("Error in ranking interaction:", err);
+    }
+  });
+
+  // Admin text commands
   client.on("messageCreate", async (msg) => {
     if (msg.author.bot || !msg.content) return;
     const cmd = msg.content.trim().toLowerCase();
@@ -434,12 +450,12 @@ module.exports = (client, options) => {
     if (cmd === "!ranking" || cmd === "ranking update") {
       await syncTrackingCycle();
       await updateGeneralRankingBoard();
-      return msg.reply("✅ **Ranking General actualizado.**");
+      return msg.reply("✅ **Global Hall of Fame updated.**");
     }
 
     if (cmd === "!resetxp" || cmd === "reset xp") {
       const isChamp = msg.member?.roles?.cache?.has(CHAMPION_ROLE_ID);
-      if (!isChamp) return msg.reply("❌ Solo los **Champion** pueden reiniciar el XP.");
+      if (!isChamp) return msg.reply("❌ Only **Champions** can reset XP.");
 
       for (const id in trackingData) {
         trackingData[id].xp = 0;
@@ -449,7 +465,7 @@ module.exports = (client, options) => {
       }
       await redis.set("tracking_data", JSON.stringify(trackingData));
       await updateGeneralRankingBoard();
-      return msg.reply("✅ **XP base reiniciado para todos los usuarios.**");
+      return msg.reply("✅ **Base XP has been reset for all users.**");
     }
   });
 };
