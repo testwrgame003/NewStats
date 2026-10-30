@@ -476,7 +476,7 @@ async function checkAndTriggerMassiveRerollAlert(group, channel, highPpmUsers) {
     .setColor(0xff2a85)
     .setTitle(`🚨 MASSIVE REROLL ACTIVATED IN ${config.label.toUpperCase()}! 🚨`)
     .setDescription(
-      `Extreme pack-opening speed has been detected right now!\n\n` +
+      `Hight pack-opening speed has been detected right now!\n\n` +
       `${turboList}\n\n` +
       `⚡ **Jump in, set your account ONLINE, and join the God Pack wave!**`
     )
