@@ -1,0 +1,19 @@
+{
+  "name": "zenith-stats-bot",
+  "version": "2.0.0",
+  "description": "Bot de estadísticas, alertas y ranking unificado para Zenith Reroll",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.34.0",
+    "canvas": "^2.11.2",
+    "discord.js": "^14.16.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "wRx-99",
+  "license": "MIT"
+}
