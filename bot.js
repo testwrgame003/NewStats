@@ -22,7 +22,7 @@ const redis = new Redis({
 const CHAMPION_ROLE_ID = "1486206362332434634";
 const PUBLIC_ALERTS_CHANNEL_ID = "1488766924321198080";
 const GLOBAL_HEARTBEAT_CHANNEL_ID = "1492795826857054301";
-const PERSONAL_CATEGORY_ID = "1565623831203287150"; // Nueva categoría solicitada
+const PERSONAL_CATEGORY_ID = "1565623831203287150";
 
 const RIVALS_SESSIONS_KEY = "rivals_sessions";
 const FARM_MODE_KEY = "system:farm_mode";
@@ -48,10 +48,10 @@ const GROUP_CONFIG = {
   }
 };
 
-const UPDATE_PANEL_INTERVAL = 10 * 60 * 1000; // 10 min
-const STORE_PPM_INTERVAL = 60 * 60 * 1000;    // 1 hora
-const MASSIVE_PPM_THRESHOLD = 15.0;           // Alerta si un usuario supera 15 PPM
-const MASSIVE_ALERT_COOLDOWN = 2 * 60 * 60 * 1000; // 2 horas anti-spam por usuario
+const UPDATE_PANEL_INTERVAL = 10 * 60 * 1000;
+const STORE_PPM_INTERVAL = 60 * 60 * 1000;
+const MASSIVE_PPM_THRESHOLD = 15.0;
+const MASSIVE_ALERT_COOLDOWN = 2 * 60 * 60 * 1000;
 
 const massivePpmCooldowns = new Map();
 
@@ -66,8 +66,10 @@ const client = new Client({
 
 // ================= CLAVES Y HELPERS REDIS =================
 
-const usersKey = (group) => `users:${group}`; const onlineKey = (group) => `online:${group}`;
-const liveStatsKey = (group) => `gp_live_stats:${group}`; const ppmHistoryKey = (group) => `ppm_history:${group}`;
+const usersKey = (group) => `users:${group}`;
+const onlineKey = (group) => `online:${group}`;
+const liveStatsKey = (group) => `gp_live_stats:${group}`;
+const ppmHistoryKey = (group) => `ppm_history:${group}`;
 
 function safeJsonParse(value, fallback) {
   try {
@@ -267,7 +269,6 @@ function normalizeHeartbeatName(value) {
 }
 
 function stripSecondPcSuffix(normName) {
-  // Convierte "arcade2", "arcade-2", "arcade_2", "arcade 2" en "arcade"
   return normName.replace(/[-_\s]*2$/, "").trim();
 }
 
@@ -290,7 +291,6 @@ function namesMatchMultiPC(heartbeatName, registeredName) {
   if (!hb || !reg) return false;
   if (hb === reg) return true;
 
-  // Soporte completo para PC1 (Arcade) y PC2 (Arcade2 / Arcade-2 / Arcade_2)
   const hbBase = stripSecondPcSuffix(hb);
   const regBase = stripSecondPcSuffix(reg);
   return hbBase === reg || hb === regBase || (hbBase.length >= 3 && hbBase === regBase);
@@ -312,7 +312,7 @@ function getUserNameCandidates(userData) {
 function findLastMessagesForUserMultiPC(messages, userData) {
   if (!messages || !Array.isArray(messages)) return [];
   const candidates = getUserNameCandidates(userData);
-  const foundBySlot = new Map(); // Guarda el último mensaje de PC1 y el último de PC2 por separado
+  const foundBySlot = new Map();
 
   for (const msg of messages) {
     const content = getMessageText(msg);
@@ -405,7 +405,73 @@ function calculateGlobalStats(onlineStats) {
     activeInstances,
     totalInstances,
     efficiency,
-    instancesDisplay: `${activeInstances}/${totalInstances} (${efficiency}\%)`, avgInstances: (users ? (activeInstances / users).toFixed(1) : "0.0"), totalPacks, users, minutesToGP: totalPPM > 0 ? (2000 / totalPPM).toFixed(1) : "∞", gpPerHour: totalPPM > 0 ? (60 / (2000 / totalPPM)).toFixed(2) : "0.00" }; }  function formatGPStats(stats) { const todayGP = stats.daily?.gp \vert{}\vert{} 0; const todayAlive = stats.daily?.alive \vert{}\vert{} 0; const history = stats.history \vert{}\vert{} [];  let totalGP = todayGP; let totalAlive = todayAlive;  for (const day of history) { totalGP += day.gp \vert{}\vert{} 0; totalAlive += day.alive \vert{}\vert{} 0; }  const formatDate = (dateStr) => { const parts = String(dateStr \vert{}\vert{} "").split("-"); if (parts.length === 3) return `${parts[1]}/${parts[2]}`; return dateStr \vert{}\vert{} "??/??"; };  const last5 = history.slice(0, 5); const historyText = last5 .map((d) => { const rate = d.gp > 0 ? Math.round((d.alive / d.gp) * 100) : 0; return `📅 \`${formatDate(d.date)}\`  ➔  🌟 **${d.gp} GP**  •  💖 **${d.alive} Alive** (\`${rate}\%\`)`; }) .join("\n");  const todayRate = todayGP > 0 ? Math.round((todayAlive / todayGP) * 100) : 0;  return { todayGP, todayAlive, todayRate, totalGP, totalAlive, historyText: historyText \vert{}\vert{} "*No history recorded yet*" }; }  async function checkAndTriggerMassiveRerollAlert(group, channel, highPpmUsers) { if (!channel \vert{}\vert{} !highPpmUsers.length) return; const now = Date.now(); const triggered = [];  for (const u of highPpmUsers) { const key = `${group}:${u.discordId}`; const lastAlert = massivePpmCooldowns.get(key) \vert{}\vert{} 0; if (now - lastAlert >= MASSIVE_ALERT_COOLDOWN) { massivePpmCooldowns.set(key, now); triggered.push(u); } }  if (!triggered.length) return;  const config = GROUP_CONFIG[group]; const turboList = triggered .map((u) => `🔥 **${u.name}** — \`⚡ ${u.ppm.toFixed(2)} PPM\` (${u.activeInstances} instancias activas)`)
+    instancesDisplay: `${activeInstances}/${totalInstances} (${efficiency}%)`,
+    avgInstances: (users ? (activeInstances / users).toFixed(1) : "0.0"),
+    totalPacks,
+    users,
+    minutesToGP: totalPPM > 0 ? (2000 / totalPPM).toFixed(1) : "∞",
+    gpPerHour: totalPPM > 0 ? (60 / (2000 / totalPPM)).toFixed(2) : "0.00"
+  };
+}
+
+function formatGPStats(stats) {
+  const todayGP = stats.daily?.gp || 0;
+  const todayAlive = stats.daily?.alive || 0;
+  const history = stats.history || [];
+
+  let totalGP = todayGP;
+  let totalAlive = todayAlive;
+
+  for (const day of history) {
+    totalGP += day.gp || 0;
+    totalAlive += day.alive || 0;
+  }
+
+  const formatDate = (dateStr) => {
+    const parts = String(dateStr || "").split("-");
+    if (parts.length === 3) return `${parts[1]}/${parts[2]}`;
+    return dateStr || "??/??";
+  };
+
+  const last5 = history.slice(0, 5);
+  const historyText = last5
+    .map((d) => {
+      const rate = d.gp > 0 ? Math.round((d.alive / d.gp) * 100) : 0;
+      return `📅 \`${formatDate(d.date)}\`  ➔  🌟 **${d.gp} GP**  •  💖 **${d.alive} Alive** (\`${rate}%\`)`;
+    })
+    .join("\n");
+
+  const todayRate = todayGP > 0 ? Math.round((todayAlive / todayGP) * 100) : 0;
+
+  return {
+    todayGP,
+    todayAlive,
+    todayRate,
+    totalGP,
+    totalAlive,
+    historyText: historyText || "*No history recorded yet*"
+  };
+}
+
+async function checkAndTriggerMassiveRerollAlert(group, channel, highPpmUsers) {
+  if (!channel || !highPpmUsers.length) return;
+  const now = Date.now();
+  const triggered = [];
+
+  for (const u of highPpmUsers) {
+    const key = `${group}:${u.discordId}`;
+    const lastAlert = massivePpmCooldowns.get(key) || 0;
+    if (now - lastAlert >= MASSIVE_ALERT_COOLDOWN) {
+      massivePpmCooldowns.set(key, now);
+      triggered.push(u);
+    }
+  }
+
+  if (!triggered.length) return;
+
+  const config = GROUP_CONFIG[group];
+  const turboList = triggered
+    .map((u) => `🔥 **${u.name}** — \`⚡ ${u.ppm.toFixed(2)} PPM\` (${u.activeInstances} instancias activas)`)
     .join("\n");
 
   const alertEmbed = new EmbedBuilder()
@@ -420,12 +486,11 @@ function calculateGlobalStats(onlineStats) {
 
   const sent = await channel.send({ embeds: [alertEmbed] }).catch(() => null);
   if (sent) {
-    // Borrar automáticamente la alerta después de 90 minutos para mantener limpio el canal de stats
     setTimeout(() => sent.delete().catch(() => {}), 90 * 60 * 1000);
   }
 }
 
-// ================= GENERADOR DEL NUEVO DASHBOARD EJECUTIVO (SIN LISTA DE USUARIOS) =================
+// ================= GENERADOR DEL NUEVO DASHBOARD EJECUTIVO =================
 
 async function generatePanel(group, panelChannel) {
   const config = GROUP_CONFIG[group];
@@ -442,7 +507,6 @@ async function generatePanel(group, panelChannel) {
   const highPpmUsers = [];
   const countedDiscordIds = new Set();
 
-  // 1. Evaluar usuarios normales del grupo que están Online
   for (const [discordId, rawUser] of Object.entries(users)) {
     const mainId = normalizeId(rawUser.main_id);
     const secId = normalizeId(rawUser.sec_id);
@@ -469,7 +533,6 @@ async function generatePanel(group, panelChannel) {
     }
   }
 
-  // 2. Evaluar sesiones activas del nuevo sistema Rivals apuntando a este grupo
   for (const session of rivalsSessions) {
     for (const member of session.members) {
       if (countedDiscordIds.has(String(member.discordId))) continue;
@@ -500,7 +563,6 @@ async function generatePanel(group, panelChannel) {
     }
   }
 
-  // Disparar alerta en el canal de estadísticas si alguien supera 15 PPM
   if (panelChannel && highPpmUsers.length > 0) {
     await checkAndTriggerMassiveRerollAlert(group, panelChannel, highPpmUsers);
   }
@@ -520,10 +582,11 @@ async function generatePanel(group, panelChannel) {
     : "";
 
   const dashboardEmbed = new EmbedBuilder()
-    .setTitle(`⚡ ZENITH TELEMETRY — ${config.label.toUpperCase()}`)
+    .setTitle(`⚡ ZENITH TELEMETRÍA — ${config.label.toUpperCase()}`)
     .setColor(farmMode ? 0xf1c40f : config.color)
     .setDescription(
-      `${farmBanner}` + `### 🚀 Velocidad Global: \`${global.totalPPM} PPM\`  •  ${tierBadge}\n` +
+      `${farmBanner}` +
+      `### 🚀 Velocidad Global: \`${global.totalPPM} PPM\`  •  ${tierBadge}\n` +
       `\`[${powerBar}]\`  *(Promedio 12h: **${cachedAvgPPM} PPM**)*\n` +
       `───────────────────────────────────────────────`
     )
