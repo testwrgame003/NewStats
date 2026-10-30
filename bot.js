@@ -17,7 +17,7 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN
 });
 
-// ================= CONFIGURACIÓN GLOBAL =================
+// ================= GLOBAL CONFIGURATION =================
 
 const CHAMPION_ROLE_ID = "1486206362332434634";
 const PUBLIC_ALERTS_CHANNEL_ID = "1488766924321198080";
@@ -64,12 +64,10 @@ const client = new Client({
   ]
 });
 
-// ================= CLAVES Y HELPERS REDIS =================
+// ================= REDIS KEYS & HELPERS =================
 
-const usersKey = (group) => `users:${group}`;
-const onlineKey = (group) => `online:${group}`;
-const liveStatsKey = (group) => `gp_live_stats:${group}`;
-const ppmHistoryKey = (group) => `ppm_history:${group}`;
+const usersKey = (group) => `users:${group}`; const onlineKey = (group) => `online:${group}`;
+const liveStatsKey = (group) => `gp_live_stats:${group}`; const ppmHistoryKey = (group) => `ppm_history:${group}`;
 
 function safeJsonParse(value, fallback) {
   try {
@@ -194,7 +192,7 @@ async function refreshAveragePPM(group) {
   return avg.toFixed(2);
 }
 
-// ================= FETCH MESSAGES & PARSERS MULTI-PC =================
+// ================= FETCH MESSAGES & MULTI-PC PARSERS =================
 
 async function fetchMessagesByHours(channel, hours) {
   const all = [];
@@ -370,7 +368,7 @@ function mergeStatsFromMessages(messages) {
   return merged;
 }
 
-// ================= CÁLCULO VISUAL Y ALERTAS DE REROLL MASIVO =================
+// ================= VISUAL HELPERS & MASSIVE REROLL ALERT =================
 
 function buildPowerBar(currentPPM, maxExpectedPPM = 120) {
   const length = 14;
@@ -471,16 +469,16 @@ async function checkAndTriggerMassiveRerollAlert(group, channel, highPpmUsers) {
 
   const config = GROUP_CONFIG[group];
   const turboList = triggered
-    .map((u) => `🔥 **${u.name}** — \`⚡ ${u.ppm.toFixed(2)} PPM\` (${u.activeInstances} instancias activas)`)
+    .map((u) => `🔥 **${u.name}** — \`⚡ ${u.ppm.toFixed(2)} PPM\` (\`🖥️ ${u.activeInstances} active instances\`)`)
     .join("\n");
 
   const alertEmbed = new EmbedBuilder()
     .setColor(0xff2a85)
-    .setTitle(`🚨 ¡REROLL MASIVO ACTIVADO EN ${config.label.toUpperCase()}! 🚨`)
+    .setTitle(`🚨 MASSIVE REROLL ACTIVATED IN ${config.label.toUpperCase()}! 🚨`)
     .setDescription(
-      `¡Se ha detectado una potencia extrema de apertura de sobres en este momento!\n\n` +
+      `Extreme pack-opening speed has been detected right now!\n\n` +
       `${turboList}\n\n` +
-      `⚡ **¡Es el momento ideal para conectarse, ponerse Online y aprovechar la racha de God Packs!**`
+      `⚡ **Jump in, set your account ONLINE, and join the God Pack wave!**`
     )
     .setTimestamp();
 
@@ -490,7 +488,7 @@ async function checkAndTriggerMassiveRerollAlert(group, channel, highPpmUsers) {
   }
 }
 
-// ================= GENERADOR DEL NUEVO DASHBOARD EJECUTIVO =================
+// ================= PANEL GENERATOR (ONLINE USERS ONLY + GLOBAL STATS) =================
 
 async function generatePanel(group, panelChannel) {
   const config = GROUP_CONFIG[group];
@@ -504,9 +502,11 @@ async function generatePanel(group, panelChannel) {
   const messages = heartbeatChannel ? await fetchMessagesByHours(heartbeatChannel, 4) : [];
 
   const onlineStats = [];
+  const processedOnlineUsers = [];
   const highPpmUsers = [];
   const countedDiscordIds = new Set();
 
+  // 1. Standard Group Online Users
   for (const [discordId, rawUser] of Object.entries(users)) {
     const mainId = normalizeId(rawUser.main_id);
     const secId = normalizeId(rawUser.sec_id);
@@ -520,9 +520,21 @@ async function generatePanel(group, panelChannel) {
       : { time: "0m", packs: 0, ppm: 0, online: [], offline: ["none"], pcCount: 0 };
 
     onlineStats.push(stats);
-    countedDiscordIds.add(discordId);
+    countedDiscordIds.add(String(discordId));
 
     const activeInst = stats.online.filter((x) => x.toLowerCase() !== "main" && x.toLowerCase() !== "none").length;
+    const offlineInst = stats.offline.includes("none") ? 0 : stats.offline.filter((x) => x.toLowerCase() !== "main").length;
+
+    processedOnlineUsers.push({
+      discordId,
+      name: rawUser.name || "Unknown",
+      stats,
+      activeInst,
+      offlineInst,
+      isRival: false,
+      rivalTag: ""
+    });
+
     if (stats.ppm > MASSIVE_PPM_THRESHOLD) {
       highPpmUsers.push({
         discordId,
@@ -533,8 +545,10 @@ async function generatePanel(group, panelChannel) {
     }
   }
 
+  // 2. Rivals 2.0 Sessions Active in this Group
   for (const session of rivalsSessions) {
-    for (const member of session.members) {
+    for (let idx = 0; idx < session.members.length; idx++) {
+      const member = session.members[idx];
       if (countedDiscordIds.has(String(member.discordId))) continue;
 
       const rivalUserData = rivalsUsers[member.discordId] || {
@@ -552,6 +566,19 @@ async function generatePanel(group, panelChannel) {
       countedDiscordIds.add(String(member.discordId));
 
       const activeInst = stats.online.filter((x) => x.toLowerCase() !== "main" && x.toLowerCase() !== "none").length;
+      const offlineInst = stats.offline.includes("none") ? 0 : stats.offline.filter((x) => x.toLowerCase() !== "main").length;
+      const isTurnActive = session.activeIndex === idx;
+
+      processedOnlineUsers.push({
+        discordId: member.discordId,
+        name: rivalUserData.name || member.name || "Rival",
+        stats,
+        activeInst,
+        offlineInst,
+        isRival: true,
+        rivalTag: isTurnActive ? "🤝 Rivals • 🟢 Active Turn" : "🤝 Rivals • ⏳ Standby"
+      });
+
       if (stats.ppm > MASSIVE_PPM_THRESHOLD) {
         highPpmUsers.push({
           discordId: member.discordId,
@@ -563,9 +590,25 @@ async function generatePanel(group, panelChannel) {
     }
   }
 
+  // Trigger > 15 PPM alert in the stats channel
   if (panelChannel && highPpmUsers.length > 0) {
     await checkAndTriggerMassiveRerollAlert(group, panelChannel, highPpmUsers);
   }
+
+  // Sort Online Users by Packs (Highest to Lowest)
+  processedOnlineUsers.sort((a, b) => b.stats.packs - a.stats.packs || b.stats.ppm - a.stats.ppm);
+
+  const onlineLines = processedOnlineUsers.map((u, index) => {
+    const rankIcon = index === 0 ? "🥇" : index === 1 ? "🥈" : index === 2 ? "🥉" : "⚔️";
+    const multiPcTag = u.stats.pcCount > 1 ? " `🖥️ 2-PC`" : "";
+    const rivalBadge = u.isRival ? ` *(${u.rivalTag})*` : "";
+    const turboIcon = u.stats.ppm > MASSIVE_PPM_THRESHOLD ? " 🔥" : "";
+
+    return (
+      `${rankIcon} **${u.name}**${multiPcTag}${rivalBadge}${turboIcon}\n` +
+      `┗ ⚡ \`${u.stats.ppm.toFixed(2)} PPM\`  •  🀄 \`${u.stats.packs.toLocaleString()}\`  •  ⏱️ \`${u.stats.time}\`  •  🖥️ \`${u.activeInst}\`  •  💤 \`${u.offlineInst}\``
+    );
+  });
 
   const global = calculateGlobalStats(onlineStats);
   const gp = formatGPStats(await getLiveStats(group));
@@ -578,53 +621,58 @@ async function generatePanel(group, panelChannel) {
   else if (global.rawTotalPPM === 0) tierBadge = "💤 **IDLE / WAITING**";
 
   const farmBanner = farmMode
-    ? "\n> 🌾 **MODO FARMEO ACTIVO:** *Alertas de expulsión desactivadas por Champion.*\n"
+    ? "\n> 🌾 **FARM MODE ACTIVE:** *Inactivity & low-instance kick timers are paused by Champion.*\n"
     : "";
 
-  const dashboardEmbed = new EmbedBuilder()
-    .setTitle(`⚡ ZENITH TELEMETRÍA — ${config.label.toUpperCase()}`)
-    .setColor(farmMode ? 0xf1c40f : config.color)
+  // Embed 1: Online Users List ONLY (No Offline List)
+  const usersEmbed = new EmbedBuilder()
+    .setTitle(`🟢 Active Rerollers — ${config.label} (${processedOnlineUsers.length})`)
+    .setColor(farmMode ? 0xf1c40f : 0x2ecc71)
     .setDescription(
-      `${farmBanner}` +
-      `### 🚀 Velocidad Global: \`${global.totalPPM} PPM\`  •  ${tierBadge}\n` +
-      `\`[${powerBar}]\`  *(Promedio 12h: **${cachedAvgPPM} PPM**)*\n` +
+      onlineLines.length > 0
+        ? onlineLines.join("\n\n").slice(0, 4000)
+        : "*⚫ No users currently online in this group.*"
+    );
+
+  // Embed 2: Global Telemetry Dashboard
+  const globalEmbed = new EmbedBuilder()
+    .setTitle(`📊 Global Telemetry — ${config.label}`) .setColor(farmMode ? 0xf1c40f : config.color) .setDescription( `${farmBanner}` +
+      `# ⚡ ${global.totalPPM} PPM  •  ${tierBadge}\n` +
+      `\`[${powerBar}]\`  *(12h Avg: **${cachedAvgPPM} PPM**)*\n` +
       `───────────────────────────────────────────────`
     )
     .addFields(
       {
-        name: "📡 Rendimiento en Vivo",
-        value:
-          `> 👥 **Rerollers Activos:** \`${global.users}\`\n` +
-          `> 🖥️ **Instancias:** \`${global.instancesDisplay}\`\n` +
-          `> 📊 **Media / Usuario:** \`${global.avgPPM} PPM\` (\`${global.avgInstances} inst\`)`,
+        name: "👥 Online Users",
+        value: `**${global.users}**`, inline: true }, { name: "🀄 Session Packs", value: `**${global.totalPacks.toLocaleString()}**`,
         inline: true
       },
       {
-        name: "🎯 Proyección de God Packs",
-        value:
-          `> ⏱️ **Tiempo Est. / GP:** \`${global.minutesToGP} min\`\n` +
-          `> 📈 **Ritmo Actual:** \`${global.gpPerHour} GP/hora\`\n` +
-          `> 🀄 **Packs En Sesión:** \`${global.totalPacks.toLocaleString()}\``,
+        name: "⚡ Avg PPM / User",
+        value: `**${global.avgPPM}**`, inline: true }, { name: "🖥️ Active Instances", value: `**${global.instancesDisplay}**`,
         inline: true
       },
       {
-        name: "🌟 Balance de God Packs",
-        value:
-          `> 🔥 **Hoy:** \`${gp.todayGP} GP\`  •  💖 \`${gp.todayAlive} Alive\` (\`${gp.todayRate}%\`)\n` +
-          `> 💫 **Total (5 Días):** \`${gp.totalGP} GP\`  •  💖 \`${gp.totalAlive} Alive\``,
-        inline: false
+        name: "📊 Avg Inst / User",
+        value: `**${global.avgInstances}**`, inline: true }, { name: "🎯 Est. GP / Hour", value: `**${global.gpPerHour}**`,
+        inline: true
       },
       {
-        name: "📆 Historial Reciente (Últimos 5 Días)",
+        name: "⏱️ Est. Min / GP",
+        value: `**${global.minutesToGP} min**`, inline: true }, { name: "🌟 GP Today", value: `**${gp.todayGP} GP**\n💖 **${gp.todayAlive} Alive** (\`${gp.todayRate}\%\`)`, inline: true }, { name: "💫 Total (5 Days)", value: `**${gp.totalGP} GP**\n💖 **${gp.totalAlive} Alive**`,
+        inline: true
+      },
+      {
+        name: "📅 Last 5 Days History",
         value: gp.historyText,
         inline: false
       }
     )
-    .setFooter({ text: "Sincronización automática cada 10 min • Multi-PC & Rivals 2.0 habilitado" })
+    .setFooter({ text: "Auto-updates every 10 mins • Multi-PC & Rivals 2.0 Enabled" })
     .setTimestamp();
 
   return {
-    embeds: [dashboardEmbed],
+    embeds: [usersEmbed, globalEmbed],
     rawTotalPPM: global.rawTotalPPM
   };
 }
@@ -654,8 +702,7 @@ async function upsertPanel(group) {
         (msg) =>
           msg.author.id === client.user.id &&
           msg.embeds.length > 0 &&
-          (msg.embeds[0].title?.includes(config.label.toUpperCase()) ||
-            msg.embeds[0].title?.includes(config.label))
+          msg.embeds.some((e) => e.title?.includes(config.label))
       );
     }
   }
@@ -693,7 +740,7 @@ async function storeAllPPM() {
   }
 }
 
-// ================= CARGAR MÓDULOS DE ALERTAS Y RANKING =================
+// ================= LOAD ALERTS & RANKING MODULES =================
 
 require("./alerts")(client, {
   GROUP_CONFIG,
@@ -715,7 +762,7 @@ require("./ranking")(client, {
 // ================= START =================
 
 client.once("ready", async () => {
-  console.log(`✅ Telemetry, Alerts & Ranking Bot conectado como: ${client.user.tag}`);
+  console.log(`✅ Telemetry, Alerts & Ranking Bot connected as: ${client.user.tag}`);
 
   client.statsPanelMessages = new Map();
   client.lastTotalPPMByGroup = new Map();
