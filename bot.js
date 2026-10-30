@@ -615,9 +615,9 @@ async function generatePanel(group, panelChannel) {
   const cachedAvgPPM = await refreshAveragePPM(group);
   const powerBar = buildPowerBar(global.rawTotalPPM, 120);
 
-  let tierBadge = "🟢 **STANDARD FLOW**";
-  if (global.rawTotalPPM >= 80) tierBadge = "🔥 **OVERDRIVE MODE**";
-  else if (global.rawTotalPPM >= 40) tierBadge = "⚡ **HIGH SPEED REROLL**";
+let tierBadge = "🟢 **STANDARD MODE**";
+  if (global.rawTotalPPM >= 40) tierBadge = "🔥 **OVERDRIVE MODE**";
+  else if (global.rawTotalPPM >= 30) tierBadge = "⚡ **HIGH SPEED REROLL**";
   else if (global.rawTotalPPM === 0) tierBadge = "💤 **IDLE / WAITING**";
 
   const farmBanner = farmMode
