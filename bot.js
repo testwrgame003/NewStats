@@ -38,13 +38,13 @@ const GROUP_CONFIG = {
     label: "Gym Leader",
     color: 0x3498db,
     heartbeatChannelId: "1491238609578360833",
-    panelChannelId: "1564890852310913034"
+    panelChannelId: "1495594175058673736"
   },
   Elite_Four: {
     label: "Elite Four",
     color: 0x9b59b6,
     heartbeatChannelId: "1483616146996465735",
-    panelChannelId: "1564890852310913034"
+    panelChannelId: "1488126321786753156"
   }
 };
 
