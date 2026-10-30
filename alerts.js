@@ -9,6 +9,7 @@ const REQUIRED_ACTIVE_INSTANCES = 2;
 const LOW_INSTANCES_TIMEOUT_MS = 45 * 60 * 1000;
 const LOW_INSTANCES_WARNING_INTERVAL_MS = 10 * 60 * 1000;
 const HEARTBEAT_SILENCE_TIMEOUT_MS = 40 * 60 * 1000;
+const ONLINE_GRACE_PERIOD_MS = 15 * 60 * 1000; // 15 minutos de gracia para el primer heartbeat
 
 const RIVALS_SESSIONS_KEY = "rivals_sessions";
 const PERSONAL_STATE_KEY = "personal_channel_state";
@@ -90,6 +91,7 @@ async function getPersonalState(redis, discordId) {
       kickReasonMsgId: null,
       warningMsgIds: [],
       wasOnline: false,
+      onlineSince: 0,
       lastOnlineGroup: null,
       lastHeartbeatAt: 0
     });
@@ -101,6 +103,7 @@ async function getPersonalState(redis, discordId) {
       kickReasonMsgId: null,
       warningMsgIds: [],
       wasOnline: false,
+      onlineSince: 0,
       lastOnlineGroup: null,
       lastHeartbeatAt: 0
     };
@@ -434,7 +437,7 @@ function buildPrettyHeartbeatEmbed({
     .setTimestamp();
 }
 
-// ================= PERSONAL CHANNEL MANAGEMENT & CLEANUP =================
+// ================= PERSONAL CHANNEL MANAGEMENT & SILENT PERMISSIONS =================
 
 async function getOrCreatePersonalChannel({
   guild,
@@ -489,13 +492,15 @@ async function getOrCreatePersonalChannel({
     }
   }
 
+  // Configuración de permisos: Silenciado por defecto para que las actualizaciones no spameen notificaciones, 
+  // permitiendo ver el canal y recibiendo notificaciones SOLO cuando son mencionados (@usuario).
   const overwrites = [
     {
-      id: guild.id,
+      id: guild.id, // @everyone
       deny: [PermissionFlagsBits.ViewChannel]
     },
     {
-      id: String(discordId),
+      id: String(discordId), // Dueño del canal
       allow: [
         PermissionFlagsBits.ViewChannel,
         PermissionFlagsBits.SendMessages,
@@ -539,7 +544,8 @@ async function getOrCreatePersonalChannel({
     type: ChannelType.GuildText,
     topic: topicTag,
     parent: PERSONAL_CHANNELS_CATEGORY_ID,
-    permissionOverwrites: overwrites
+    permissionOverwrites: overwrites,
+    defaultMessageNotifications: 2 // 2 en Discord = Solo Menciones (Silenciado de spam general)
   }).catch((err) => {
     console.error("Error creating personal channel:", err);
     return null;
@@ -776,7 +782,7 @@ module.exports = (client, options) => {
   } = options;
 
   client.once("ready", () => {
-    console.log("✅ alerts.js 2.0 loaded (English UI + Personal Category + Multi-PC + Rivals + Farm Mode)");
+    console.log("✅ alerts.js 2.1 loaded (English UI + 15m Grace Period + Muted Channels + Farm Mode)");
     setInterval(scanOnlineStatusAndTimeouts, 3 * 60 * 1000);
   });
 
@@ -822,7 +828,7 @@ module.exports = (client, options) => {
         }
       }
 
-      // 1. Detect users who transitioned from Online -> Offline to post their Last Connection card
+      // 1. Detect users who transitioned Online -> Offline
       if (allStatesRaw && typeof allStatesRaw === "object") {
         for (const [discordId, rawState] of Object.entries(allStatesRaw)) {
           const state = safeJsonParse(rawState, null);
@@ -844,13 +850,23 @@ module.exports = (client, options) => {
         }
       }
 
-      // 2. If Farm Mode is OFF, set users offline if they haven't sent any Heartbeat for 40 minutes
+      // 2. Timeout de 40 min sin heartbeat (respetando período de gracia de 15 min al entrar)
       if (!farmMode) {
         for (const [discordId, info] of currentlyOnlineUsers.entries()) {
           const state = await getPersonalState(redis, discordId);
           if (!state.lastHeartbeatAt) {
-            state.lastHeartbeatAt = now;
-            await savePersonalState(redis, discordId, state);
+            // Si recién se puso online, asignamos el timestamp de entrada
+            if (!state.onlineSince) {
+              state.onlineSince = now;
+              state.lastHeartbeatAt = now;
+              await savePersonalState(redis, discordId, state);
+            }
+            continue;
+          }
+
+          // Aplicar período de gracia de 15 minutos para que el primer heartbeat no dispare timeout falso
+          const timeSinceOnline = now - (state.onlineSince || now);
+          if (timeSinceOnline < ONLINE_GRACE_PERIOD_MS) {
             continue;
           }
 
@@ -1022,6 +1038,10 @@ module.exports = (client, options) => {
       if (rivalSession) isRival = true;
 
       if (isCurrentlyOnline) {
+        if (!state.wasOnline) {
+          // Marca el inicio exacto del estado online para otorgar los 15 minutos de gracia al primer heartbeat
+          state.onlineSince = Date.now();
+        }
         state.wasOnline = true;
         await clearTransientMessagesOnOnline(userChannel, state);
       }
@@ -1066,7 +1086,9 @@ module.exports = (client, options) => {
 
       await savePersonalState(redis, matchedDiscordId, state);
 
-      if (isCurrentlyOnline && !farmMode) {
+      // Si ya pasó el período de gracia de 15 minutos desde que se puso online, verificar instancias
+      const timeSinceOnline = Date.now() - (state.onlineSince || Date.now());
+      if (isCurrentlyOnline && !farmMode && timeSinceOnline >= ONLINE_GRACE_PERIOD_MS) {
         if (merged.activeCount < REQUIRED_ACTIVE_INSTANCES) {
           await startLowInstancesCountdown({
             redis,
@@ -1081,7 +1103,7 @@ module.exports = (client, options) => {
           if (cancelLowInstanceTimer(matchedDiscordId)) {
             const updatedState = await getPersonalState(redis, matchedDiscordId);
             await clearTransientMessagesOnOnline(userChannel, updatedState);
-            await savePersonalState(redis, discordId, updatedState);
+            await savePersonalState(redis, matchedDiscordId, updatedState);
           }
         }
       }
