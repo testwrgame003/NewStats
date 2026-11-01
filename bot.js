@@ -52,6 +52,7 @@ const UPDATE_PANEL_INTERVAL = 5 * 60 * 1000;
 const STORE_PPM_INTERVAL = 60 * 60 * 1000;
 const MASSIVE_PPM_THRESHOLD = 15.0;
 const MASSIVE_ALERT_COOLDOWN = 2 * 60 * 60 * 1000;
+const HEARTBEAT_TIMEOUT_MS = 30 * 60 * 1000;
 
 const massivePpmCooldowns = new Map();
 
@@ -490,6 +491,8 @@ async function checkAndTriggerMassiveRerollAlert(group, channel, highPpmUsers) {
 
 // ================= PANEL GENERATOR (ONLINE USERS ONLY + GLOBAL STATS) =================
 
+// ================= PANEL GENERATOR (ONLINE USERS ONLY + GLOBAL STATS) =================
+
 async function generatePanel(group, panelChannel) {
   const config = GROUP_CONFIG[group];
   const users = await getUsers(group);
@@ -505,6 +508,15 @@ async function generatePanel(group, panelChannel) {
   const processedOnlineUsers = [];
   const highPpmUsers = [];
   const countedDiscordIds = new Set();
+  
+  const now = Date.now();
+
+  // Cargamos los bloqueos manuales de PPM (!stopppm)
+  let lastStopData = {};
+  try {
+    const rawStops = await redis.hgetall("last_stopppm");
+    if (rawStops && typeof rawStops === "object") lastStopData = rawStops;
+  } catch (err) {}
 
   // 1. Standard Group Online Users
   for (const [discordId, rawUser] of Object.entries(users)) {
@@ -515,8 +527,16 @@ async function generatePanel(group, panelChannel) {
     if (!isOnline) continue;
 
     const userMessages = findLastMessagesForUserMultiPC(messages, rawUser);
-    const stats = userMessages.length
-      ? mergeStatsFromMessages(userMessages)
+    const userLastStop = Number(lastStopData[discordId]) || 0;
+    
+    // FILTRO: Mensajes menores a 20 mins Y que se hayan enviado DESPUÉS de un !stopppm
+    const validMessages = userMessages.filter(msg => 
+      (now - msg.createdTimestamp) <= HEARTBEAT_TIMEOUT_MS &&
+      msg.createdTimestamp > userLastStop
+    );
+
+    const stats = validMessages.length
+      ? mergeStatsFromMessages(validMessages)
       : { time: "0m", packs: 0, ppm: 0, online: [], offline: ["none"], pcCount: 0 };
 
     onlineStats.push(stats);
@@ -558,8 +578,15 @@ async function generatePanel(group, panelChannel) {
       };
 
       const userMessages = findLastMessagesForUserMultiPC(messages, rivalUserData);
-      const stats = userMessages.length
-        ? mergeStatsFromMessages(userMessages)
+      const userLastStop = Number(lastStopData[member.discordId]) || 0;
+      
+      const validMessages = userMessages.filter(msg => 
+        (now - msg.createdTimestamp) <= HEARTBEAT_TIMEOUT_MS &&
+        msg.createdTimestamp > userLastStop
+      );
+
+      const stats = validMessages.length
+        ? mergeStatsFromMessages(validMessages)
         : { time: "0m", packs: 0, ppm: 0, online: [], offline: ["none"], pcCount: 0 };
 
       onlineStats.push(stats);
@@ -590,12 +617,10 @@ async function generatePanel(group, panelChannel) {
     }
   }
 
-  // Trigger > 15 PPM alert in the stats channel
   if (panelChannel && highPpmUsers.length > 0) {
     await checkAndTriggerMassiveRerollAlert(group, panelChannel, highPpmUsers);
   }
 
-  // Sort Online Users by Packs (Highest to Lowest)
   processedOnlineUsers.sort((a, b) => b.stats.packs - a.stats.packs || b.stats.ppm - a.stats.ppm);
 
   const onlineLines = processedOnlineUsers.map((u, index) => {
@@ -615,7 +640,7 @@ async function generatePanel(group, panelChannel) {
   const cachedAvgPPM = await refreshAveragePPM(group);
   const powerBar = buildPowerBar(global.rawTotalPPM, 120);
 
-let tierBadge = "🟢 **STANDARD MODE**";
+  let tierBadge = "🟢 **STANDARD MODE**";
   if (global.rawTotalPPM >= 40) tierBadge = "🔥 **OVERDRIVE MODE**";
   else if (global.rawTotalPPM >= 30) tierBadge = "⚡ **HIGH SPEED REROLL**";
   else if (global.rawTotalPPM === 0) tierBadge = "💤 **IDLE / WAITING**";
@@ -624,7 +649,6 @@ let tierBadge = "🟢 **STANDARD MODE**";
     ? "\n> 🌾 **FARM MODE ACTIVE:** *Inactivity & low-instance kick timers are paused by Champion.*\n"
     : "";
 
-  // Embed 1: Online Users List ONLY (No Offline List)
   const usersEmbed = new EmbedBuilder()
     .setTitle(`🟢 Active Rerollers — ${config.label} (${processedOnlineUsers.length})`)
     .setColor(farmMode ? 0xf1c40f : 0x2ecc71)
@@ -634,41 +658,28 @@ let tierBadge = "🟢 **STANDARD MODE**";
         : "*⚫ No users currently online in this group.*"
     );
 
-  // Embed 2: Global Telemetry Dashboard
   const globalEmbed = new EmbedBuilder()
-    .setTitle(`📊 Global Telemetry — ${config.label}`) .setColor(farmMode ? 0xf1c40f : config.color) .setDescription( `${farmBanner}` +
+    .setTitle(`📊 Global Telemetry — ${config.label}`)
+    .setColor(farmMode ? 0xf1c40f : config.color)
+    .setDescription(
+      `${farmBanner}` +
       `# ⚡ ${global.totalPPM} PPM  •  ${tierBadge}\n` +
       `\`[${powerBar}]\`  *(12h Avg: **${cachedAvgPPM} PPM**)*\n` +
       `───────────────────────────────────────────────`
     )
     .addFields(
-      {
-        name: "👥 Online Users",
-        value: `**${global.users}**`, inline: true }, { name: "🀄 Session Packs", value: `**${global.totalPacks.toLocaleString()}**`,
-        inline: true
-      },
-      {
-        name: "⚡ Avg PPM / User",
-        value: `**${global.avgPPM}**`, inline: true }, { name: "🖥️ Active Instances", value: `**${global.instancesDisplay}**`,
-        inline: true
-      },
-      {
-        name: "📊 Avg Inst / User",
-        value: `**${global.avgInstances}**`, inline: true }, { name: "🎯 Est. GP / Hour", value: `**${global.gpPerHour}**`,
-        inline: true
-      },
-      {
-        name: "⏱️ Est. Min / GP",
-        value: `**${global.minutesToGP} min**`, inline: true }, { name: "🌟 GP Today", value: `**${gp.todayGP} GP**\n💖 **${gp.todayAlive} Alive** (\`${gp.todayRate}\%\`)`, inline: true }, { name: "💫 Total (5 Days)", value: `**${gp.totalGP} GP**\n💖 **${gp.totalAlive} Alive**`,
-        inline: true
-      },
-      {
-        name: "📅 Last 5 Days History",
-        value: gp.historyText,
-        inline: false
-      }
+      { name: "👥 Online Users", value: `**${global.users}**`, inline: true },
+      { name: "🀄 Session Packs", value: `**${global.totalPacks.toLocaleString()}**`, inline: true },
+      { name: "⚡ Avg PPM / User", value: `**${global.avgPPM}**`, inline: true },
+      { name: "🖥️ Active Instances", value: `**${global.instancesDisplay}**`, inline: true },
+      { name: "📊 Avg Inst / User", value: `**${global.avgInstances}**`, inline: true },
+      { name: "🎯 Est. GP / Hour", value: `**${global.gpPerHour}**`, inline: true },
+      { name: "⏱️ Est. Min / GP", value: `**${global.minutesToGP} min**`, inline: true },
+      { name: "🌟 GP Today", value: `**${gp.todayGP} GP**\n💖 **${gp.todayAlive} Alive** (\`${gp.todayRate}%\`)`, inline: true },
+      { name: "💫 Total (5 Days)", value: `**${gp.totalGP} GP**\n💖 **${gp.totalAlive} Alive**`, inline: true },
+      { name: "📅 Last 5 Days History", value: gp.historyText, inline: false }
     )
-    .setFooter({ text: "Auto-updates every 10 mins • Multi-PC & Rivals 2.0 Enabled" })
+    .setFooter({ text: "Auto-updates every 5 mins • Multi-PC & Rivals 2.0 Enabled" })
     .setTimestamp();
 
   return {
@@ -739,7 +750,37 @@ async function storeAllPPM() {
     }
   }
 }
+// ================= COMANDOS DE CHAMPION =================
 
+client.on("messageCreate", async (message) => {
+  if (message.author.bot) return;
+
+  if (message.content.toLowerCase().startsWith("!stopppm")) {
+    // 1. Verificar si tiene el rol de Champion
+    if (!message.member?.roles.cache.has(CHAMPION_ROLE_ID)) {
+      return message.reply("❌ No tienes permisos de Champion para usar este comando.");
+    }
+
+    // 2. Verificar si se mencionó a alguien
+    const targetUser = message.mentions.users.first();
+    if (!targetUser) {
+      return message.reply("⚠️ Debes mencionar al usuario cuyo PPM quieres detener. Ejemplo: `!stopppm @usuario`");
+    }
+
+    try {
+      // 3. Registrar el timestamp actual para invalidar sus heartbeats anteriores
+      await redis.hset("last_stopppm", targetUser.id, Date.now());
+      
+      await message.reply(`✅ El PPM y las instancias de **${targetUser.username}** han sido forzados a **0**.\n*(Sus reportes anteriores han sido invalidados. Si envía un nuevo heartbeat, el panel volverá a contar desde cero).*`);
+      
+      // 4. Forzar la actualización del panel inmediatamente
+      updateAllPanels();
+    } catch (err) {
+      console.error("Error al usar !stopppm:", err);
+      message.reply("❌ Ocurrió un error al intentar detener el PPM.");
+    }
+  }
+});
 // ================= LOAD ALERTS & RANKING MODULES =================
 
 require("./alerts")(client, {
