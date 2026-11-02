@@ -14,6 +14,7 @@ const ONLINE_GRACE_PERIOD_MS = 15 * 60 * 1000; // 15 minutos de gracia para el p
 const RIVALS_SESSIONS_KEY = "rivals_sessions";
 const PERSONAL_STATE_KEY = "personal_channel_state";
 const FARM_MODE_KEY = "system:farm_mode";
+const SHARING_USERS_KEY = "active_sharing_users";
 
 const crashTimers = new Map();
 const USERS_CACHE = new Map();
@@ -22,7 +23,8 @@ const MULTI_PC_CACHE = new Map();
 
 // ================= REDIS HELPERS =================
 
-const usersKey = (group) => `users:${group}`; const onlineKey = (group) => `online:${group}`;
+const usersKey = (group) => `users:${group}`;
+const onlineKey = (group) => `online:${group}`;
 
 function safeJsonParse(value, fallback = {}) {
   try {
@@ -74,6 +76,15 @@ async function isFarmModeActive(redis) {
     return val === "true" || val === true || val === 1 || val === "1";
   } catch {
     return false;
+  }
+}
+
+async function getActiveSharingUsers(redis) {
+  try {
+    const raw = await redis.get(SHARING_USERS_KEY);
+    return safeJsonParse(raw, {});
+  } catch {
+    return {};
   }
 }
 
@@ -151,7 +162,7 @@ async function removeOnlineIDs(redis, group, ids) {
 
 function getUserGameIds(userData) {
   const ids = [];
-  const mainId = normalizeId(userData?.main_id);
+  const mainId = normalizeId(userData?.main_id || userData?.gameId);
   const secId = normalizeId(userData?.sec_id);
   if (/^\d{16}$/.test(mainId)) ids.push(mainId);
   if (/^\d{16}$/.test(secId)) ids.push(secId);
@@ -161,6 +172,44 @@ function getUserGameIds(userData) {
 function isUserOnlineInGroup(userData, onlineIds) {
   const set = new Set(onlineIds.map(normalizeId));
   return getUserGameIds(userData).some((id) => set.has(id));
+}
+
+// Busca a qué usuario pertenece un ID de juego de 16 dígitos en todos los registros
+async function findUserByGameId(redis, GROUP_CONFIG, targetGameId) {
+  const cleanTarget = normalizeId(targetGameId);
+  if (!/^\d{16}$/.test(cleanTarget)) return null;
+
+  const groupsToSearch = [...Object.keys(GROUP_CONFIG), "Rivals"];
+
+  for (const group of groupsToSearch) {
+    const users = await loadUsers(redis, group);
+    for (const [discordId, uData] of Object.entries(users)) {
+      const gameIds = getUserGameIds(uData);
+      if (gameIds.includes(cleanTarget)) {
+        return { discordId, userData: uData, group };
+      }
+    }
+  }
+
+  // Buscar también en las sesiones activas de Rivals
+  const rivalsSessions = await getAllRivalsSessions(redis);
+  for (const sess of rivalsSessions) {
+    for (const m of sess.members || []) {
+      if (normalizeId(m.gameId) === cleanTarget) {
+        return {
+          discordId: String(m.discordId),
+          userData: {
+            name: m.name,
+            heartbeatName: m.heartbeatName || m.name,
+            main_id: m.gameId
+          },
+          group: sess.targetGroup || "Rivals"
+        };
+      }
+    }
+  }
+
+  return null;
 }
 
 // ================= RIVALS 2.0 INTEGRATION =================
@@ -230,9 +279,9 @@ function getMessageText(message) {
   if ((!content || content.trim() === "") && message.embeds?.length > 0) {
     const embed = message.embeds[0];
     content =
-      embed.description ||
-      embed.fields?.map((f) => `${f.name}\n${f.value}`).join("\n") ||
-      "";
+      (embed.title ? `${embed.title}\n` : "") +
+      (embed.description || "") +
+      (embed.fields?.map((f) => `\n${f.name}\n${f.value}`).join("\n") || "");
   }
   return String(content || "").replace(/```/g, "").trim();
 }
@@ -492,15 +541,13 @@ async function getOrCreatePersonalChannel({
     }
   }
 
-  // Configuración de permisos: Silenciado por defecto para que las actualizaciones no spameen notificaciones, 
-  // permitiendo ver el canal y recibiendo notificaciones SOLO cuando son mencionados (@usuario).
   const overwrites = [
     {
-      id: guild.id, // @everyone
+      id: guild.id,
       deny: [PermissionFlagsBits.ViewChannel]
     },
     {
-      id: String(discordId), // Dueño del canal
+      id: String(discordId),
       allow: [
         PermissionFlagsBits.ViewChannel,
         PermissionFlagsBits.SendMessages,
@@ -545,7 +592,7 @@ async function getOrCreatePersonalChannel({
     topic: topicTag,
     parent: PERSONAL_CHANNELS_CATEGORY_ID,
     permissionOverwrites: overwrites,
-    defaultMessageNotifications: 2 // 2 en Discord = Solo Menciones (Silenciado de spam general)
+    defaultMessageNotifications: 2
   }).catch((err) => {
     console.error("Error creating personal channel:", err);
     return null;
@@ -643,6 +690,9 @@ async function startLowInstancesCountdown({
 
   if (await isFarmModeActive(redis)) return;
 
+  const sharingUsers = await getActiveSharingUsers(redis);
+  if (sharingUsers[String(discordId)]) return;
+
   let elapsed = 0;
   const state = await getPersonalState(redis, discordId);
 
@@ -669,7 +719,8 @@ async function startLowInstancesCountdown({
 
   const interval = setInterval(async () => {
     try {
-      if (await isFarmModeActive(redis)) {
+      const currentSharing = await getActiveSharingUsers(redis);
+      if ((await isFarmModeActive(redis)) || currentSharing[String(discordId)]) {
         cancelLowInstanceTimer(discordId);
         return;
       }
@@ -724,7 +775,8 @@ async function startLowInstancesCountdown({
       clearInterval(interval);
       crashTimers.delete(timerKey);
 
-      if (await isFarmModeActive(redis)) return;
+      const currentSharing = await getActiveSharingUsers(redis);
+      if ((await isFarmModeActive(redis)) || currentSharing[String(discordId)]) return;
 
       const activeNow = getCurrentActiveInstancesForUser(discordId);
       if (activeNow >= REQUIRED_ACTIVE_INSTANCES) return;
@@ -782,13 +834,14 @@ module.exports = (client, options) => {
   } = options;
 
   client.once("ready", () => {
-    console.log("✅ alerts.js 2.1 loaded (English UI + 15m Grace Period + Muted Channels + Farm Mode)");
+    console.log("✅ alerts.js 2.2 loaded (Double Reroll Detector + Account Sharing Protection + Farm Mode)");
     setInterval(scanOnlineStatusAndTimeouts, 3 * 60 * 1000);
   });
 
   async function scanOnlineStatusAndTimeouts() {
     try {
       const farmMode = await isFarmModeActive(redis);
+      const sharingUsers = await getActiveSharingUsers(redis);
       const now = Date.now();
       const guild = client.guilds.cache.first();
       if (!guild) return;
@@ -850,12 +903,17 @@ module.exports = (client, options) => {
         }
       }
 
-      // 2. Timeout de 40 min sin heartbeat (respetando período de gracia de 15 min al entrar)
+      // 2. Timeout de 40 min sin heartbeat (respetando período de gracia y usuarios en Account Sharing)
       if (!farmMode) {
         for (const [discordId, info] of currentlyOnlineUsers.entries()) {
+          // Si está compartiendo cuentas en el GP Farm Host (🟢), no expulsar por silencio de heartbeat
+          if (sharingUsers[String(discordId)]) {
+            cancelLowInstanceTimer(discordId);
+            continue;
+          }
+
           const state = await getPersonalState(redis, discordId);
           if (!state.lastHeartbeatAt) {
-            // Si recién se puso online, asignamos el timestamp de entrada
             if (!state.onlineSince) {
               state.onlineSince = now;
               state.lastHeartbeatAt = now;
@@ -864,7 +922,6 @@ module.exports = (client, options) => {
             continue;
           }
 
-          // Aplicar período de gracia de 15 minutos para que el primer heartbeat no dispare timeout falso
           const timeSinceOnline = now - (state.onlineSince || now);
           if (timeSinceOnline < ONLINE_GRACE_PERIOD_MS) {
             continue;
@@ -916,7 +973,64 @@ module.exports = (client, options) => {
 
   client.on("messageCreate", async (message) => {
     try {
-      // --- A. FARM MODE COMMANDS FOR CHAMPIONS (!farm on / !farm off / !farm status) ---
+      if (message.author.id === client.user.id) return;
+
+      const rawText = getMessageText(message);
+
+      // --- A. DETECTOR DE "Possible double reroll" ---
+      if (rawText && /possible\s+double\s+reroll/i.test(rawText)) {
+        const lines = rawText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+        const firstLine = lines[0] || rawText;
+
+        // Extrae el ID de 16 dígitos en formato 4079-1771-9565-4557 o 4079177195654557
+        const idMatch = firstLine.match(/(\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}|\b\d{16}\b)/);
+        if (idMatch) {
+          const rawFormattedId = idMatch[1];
+          const cleanGameId = normalizeId(rawFormattedId);
+
+          const foundOwner = await findUserByGameId(redis, GROUP_CONFIG, cleanGameId);
+          if (foundOwner && message.guild) {
+            const { discordId, userData } = foundOwner;
+            const member = await message.guild.members.fetch(discordId).catch(() => null);
+            const state = await getPersonalState(redis, discordId);
+
+            const userChannel = await getOrCreatePersonalChannel({
+              guild: message.guild,
+              member,
+              userData,
+              discordId,
+              championRoleId: CHAMPION_ROLE_ID,
+              state
+            });
+
+            if (userChannel) {
+              if (state.channelId !== userChannel.id) {
+                state.channelId = userChannel.id;
+                await savePersonalState(redis, discordId, state);
+              }
+
+              const doubleRerollEmbed = new EmbedBuilder()
+                .setColor(0xffa502)
+                .setTitle("⚠️ POSSIBLE DOUBLE REROLL / FULL FRIEND LIST")
+                .setDescription(rawText)
+                .addFields(
+                  { name: "👤 User", value: `<@${discordId}>`, inline: true },
+                  { name: "🎮 Main ID", value: `\`${rawFormattedId}\``, inline: true }
+                )
+                .setFooter({ text: "Please clean your friend list in-game so farm hosts can add you." })
+                .setTimestamp();
+
+              await userChannel.send({
+                content: `<@${discordId}> ⚠️ **Attention required regarding your Main account (\`${rawFormattedId}\`):**`,
+                embeds: [doubleRerollEmbed]
+              }).catch((err) => console.error("Error forwarding double reroll alert:", err));
+            }
+          }
+        }
+        return;
+      }
+
+      // --- B. FARM MODE COMMANDS FOR CHAMPIONS (!farm on / !farm off / !farm status) ---
       if (!message.author.bot && message.content) {
         const lower = message.content.trim().toLowerCase();
         if (lower === "!farm on" || lower === "!farm off" || lower === "!farm status") {
@@ -956,13 +1070,13 @@ module.exports = (client, options) => {
         }
       }
 
-      // --- B. INCOMING HEARTBEAT PROCESSING ---
+      // --- C. INCOMING HEARTBEAT PROCESSING ---
       const group = Object.keys(GROUP_CONFIG).find(
         (g) => GROUP_CONFIG[g].heartbeatChannelId === message.channel.id
       );
       if (!group) return;
 
-      const content = getMessageText(message);
+      const content = rawText;
       if (!content) return;
 
       const rawHbName = extractHeartbeatName(content);
@@ -1039,7 +1153,6 @@ module.exports = (client, options) => {
 
       if (isCurrentlyOnline) {
         if (!state.wasOnline) {
-          // Marca el inicio exacto del estado online para otorgar los 15 minutos de gracia al primer heartbeat
           state.onlineSince = Date.now();
         }
         state.wasOnline = true;
@@ -1086,9 +1199,11 @@ module.exports = (client, options) => {
 
       await savePersonalState(redis, matchedDiscordId, state);
 
-      // Si ya pasó el período de gracia de 15 minutos desde que se puso online, verificar instancias
+      const sharingUsers = await getActiveSharingUsers(redis);
+      const isSharing = Boolean(sharingUsers[String(matchedDiscordId)]);
+
       const timeSinceOnline = Date.now() - (state.onlineSince || Date.now());
-      if (isCurrentlyOnline && !farmMode && timeSinceOnline >= ONLINE_GRACE_PERIOD_MS) {
+      if (isCurrentlyOnline && !farmMode && !isSharing && timeSinceOnline >= ONLINE_GRACE_PERIOD_MS) {
         if (merged.activeCount < REQUIRED_ACTIVE_INSTANCES) {
           await startLowInstancesCountdown({
             redis,
