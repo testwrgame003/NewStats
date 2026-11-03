@@ -4,6 +4,9 @@ const {
   ChannelType
 } = require("discord.js");
 
+// ================= GLOBAL CONFIGURATION =================
+const ENABLE_DOUBLE_REROLL_ALERTS = false; // 🛑 Cambia a true para REACTIVAR la detección de Double Reroll
+
 const PERSONAL_CHANNELS_CATEGORY_ID = "1565623831203287150";
 const REQUIRED_ACTIVE_INSTANCES = 2;
 const LOW_INSTANCES_TIMEOUT_MS = 45 * 60 * 1000;
@@ -23,8 +26,7 @@ const MULTI_PC_CACHE = new Map();
 
 // ================= REDIS HELPERS =================
 
-const usersKey = (group) => `users:${group}`;
-const onlineKey = (group) => `online:${group}`;
+const usersKey = (group) => `users:${group}`; const onlineKey = (group) => `online:${group}`;
 
 function safeJsonParse(value, fallback = {}) {
   try {
@@ -834,7 +836,7 @@ module.exports = (client, options) => {
   } = options;
 
   client.once("ready", () => {
-    console.log("✅ alerts.js 2.2 loaded (Double Reroll Detector + Account Sharing Protection + Farm Mode)");
+    console.log("✅ alerts.js 2.3 loaded (Toggleable Double Reroll Detector + Farm Mode)");
     setInterval(scanOnlineStatusAndTimeouts, 3 * 60 * 1000);
   });
 
@@ -978,11 +980,11 @@ module.exports = (client, options) => {
       const rawText = getMessageText(message);
 
       // --- A. DETECTOR DE "Possible double reroll" ---
-      if (rawText && /possible\s+double\s+reroll/i.test(rawText)) {
+      // 🛑 Solo se ejecutará si la variable ENABLE_DOUBLE_REROLL_ALERTS es verdadera
+      if (ENABLE_DOUBLE_REROLL_ALERTS && rawText && /possible\s+double\s+reroll/i.test(rawText)) {
         const lines = rawText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
         const firstLine = lines[0] || rawText;
 
-        // Extrae el ID de 16 dígitos en formato 4079-1771-9565-4557 o 4079177195654557
         const idMatch = firstLine.match(/(\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}|\b\d{16}\b)/);
         if (idMatch) {
           const rawFormattedId = idMatch[1];
