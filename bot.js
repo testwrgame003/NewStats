@@ -20,25 +20,18 @@ const redis = new Redis({
 // ================= GLOBAL CONFIGURATION =================
 
 const CHAMPION_ROLE_ID = "1486206362332434634";
+const LEGEND_ROLE_ID = process.env.LEGEND_ROLE_ID || ""; // Opcional: también detecta automáticamente por nombre de rol "Legend"
 const PUBLIC_ALERTS_CHANNEL_ID = "1488766924321198080";
 const GLOBAL_HEARTBEAT_CHANNEL_ID = "1492795826857054301";
 const PERSONAL_CATEGORY_ID = "1565623831203287150";
 
-// ID del canal donde está el panel "GP farm host" y llegan los logs de "Possible double reroll"
-// Si tienes un ID específico ponlo aquí o en tu .env como FARM_HOST_CHANNEL_ID
 const FARM_HOST_CHANNEL_ID = process.env.FARM_HOST_CHANNEL_ID || PUBLIC_ALERTS_CHANNEL_ID;
 
-const RIVALS_SESSIONS_KEY = "rivals_sessions";
 const FARM_MODE_KEY = "system:farm_mode";
 const SHARING_USERS_KEY = "active_sharing_users";
 
+// Solo Elite Four y Gym Leader
 const GROUP_CONFIG = {
-  Trainer: {
-    label: "Trainer",
-    color: 0x2ecc71,
-    heartbeatChannelId: "1486243169422020648",
-    panelChannelId: "1564890852310913034"
-  },
   Gym_Leader: {
     label: "Gym Leader",
     color: 0x3498db,
@@ -55,13 +48,12 @@ const GROUP_CONFIG = {
 
 const UPDATE_PANEL_INTERVAL = 5 * 60 * 1000;
 const STORE_PPM_INTERVAL = 60 * 60 * 1000;
-const SCAN_SHARING_INTERVAL = 20 * 60 * 1000; // Escaneo del panel GP farm host cada 20 minutos
+const SCAN_SHARING_INTERVAL = 20 * 60 * 1000;
 const MASSIVE_PPM_THRESHOLD = 15.0;
 const MASSIVE_ALERT_COOLDOWN = 2 * 60 * 60 * 1000;
 const HEARTBEAT_TIMEOUT_MS = 30 * 60 * 1000;
 
 const massivePpmCooldowns = new Map();
-// Mapa en memoria de discordId -> { hosts: ["Arcade", "wR98"], ready: 1628, total: 2608 }
 const activeSharingUsersMap = new Map();
 
 const client = new Client({
@@ -129,24 +121,6 @@ async function getOnlineIDs(group) {
   }
 }
 
-async function getRivalsSessionsByGroup(targetGroup) {
-  try {
-    const rawData = await redis.hgetall(RIVALS_SESSIONS_KEY);
-    if (!rawData || typeof rawData !== "object") return [];
-    const sessions = [];
-    for (const raw of Object.values(rawData)) {
-      const s = safeJsonParse(raw, null);
-      if (s && s.targetGroup === targetGroup && Array.isArray(s.members) && s.members.length > 0) {
-        sessions.push(s);
-      }
-    }
-    return sessions;
-  } catch (err) {
-    console.error("❌ Error loading Rivals sessions:", err);
-    return [];
-  }
-}
-
 async function getLiveStats(group) {
   try {
     const data = await redis.get(liveStatsKey(group));
@@ -203,7 +177,14 @@ async function refreshAveragePPM(group) {
   return avg.toFixed(2);
 }
 
-// ================= FUZZY NAME MATCHING & GP FARM HOST SCANNER =================
+// Verifica si un miembro tiene el rol "Legend" (Sharing Proxies)
+function hasLegendRole(member) {
+  if (!member?.roles?.cache) return false;
+  if (LEGEND_ROLE_ID && member.roles.cache.has(LEGEND_ROLE_ID)) return true;
+  return member.roles.cache.some((r) => r.name.trim().toLowerCase() === "legend");
+}
+
+// ================= FUZZY NAME MATCHING & IMPROVED GP FARM HOST SCANNER =================
 
 function cleanNameForComparison(str) {
   return String(str || "")
@@ -215,12 +196,11 @@ function cleanNameForComparison(str) {
     .toLowerCase();
 }
 
-// Reduce letras repetidas (ej. "creeeder" -> "creder") y quita sufijos cortos como p1, 91, etc.
 function simplifyRootName(str) {
   const cleaned = cleanNameForComparison(str);
   const collapsed = cleaned.replace(/(.)\1+/g, "$1");
-  const stripped = collapsed.replace(/[p_-]?\d{1,3}$/i, "");
-  return stripped.length >= 3 ? stripped : collapsed;
+  const stripped = collapsed.replace(/(?:[p_-]?\d{1,4}|[_-]?(?:main|alt|bot|host|gp|pc\d*))$/i, "");
+  return stripped.length >= 2 ? stripped : collapsed;
 }
 
 function levenshteinDistance(a, b) {
@@ -250,19 +230,18 @@ function calculateNameSimilarity(rawA, rawB) {
 
   const rootA = simplifyRootName(a);
   const rootB = simplifyRootName(b);
-  if (rootA && rootB && rootA === rootB && rootA.length >= 3) {
-    return 0.95;
+  if (rootA && rootB && rootA === rootB && rootA.length >= 2) {
+    return 0.96;
   }
 
-  // Si uno empieza o contiene al otro (ej: "creederp1" y "creeder" o "creeeder91" y "creeder")
   const shorter = a.length <= b.length ? a : b;
   const longer = a.length > b.length ? a : b;
   if (shorter.length >= 3 && (longer.startsWith(shorter) || longer.includes(shorter))) {
     const ratio = shorter.length / longer.length;
-    if (ratio >= 0.60) return 0.88;
+    if (ratio >= 0.55) return 0.89;
   }
   if (rootA.length >= 3 && rootB.length >= 3 && (rootA.includes(rootB) || rootB.includes(rootA))) {
-    return 0.86;
+    return 0.87;
   }
 
   const maxLen = Math.max(a.length, b.length);
@@ -274,16 +253,6 @@ function calculateNameSimilarity(rawA, rawB) {
   const scoreRoot = maxRootLen > 0 ? 1 - distRoot / maxRootLen : 0;
 
   return Math.max(scoreFull, scoreRoot);
-}
-
-function isFuzzyUserMatch(panelName, userData, threshold = 0.78) {
-  const candidates = getUserNameCandidates(userData);
-  for (const cand of candidates) {
-    if (calculateNameSimilarity(panelName, cand) >= threshold) {
-      return true;
-    }
-  }
-  return false;
 }
 
 function parseFarmHostPanelMessage(msg) {
@@ -300,49 +269,52 @@ function parseFarmHostPanelMessage(msg) {
       const fieldsText = Array.isArray(emb.fields)
         ? emb.fields.map((f) => `${f.name}\n${f.value}`).join("\n")
         : "";
-      blocks.push({ title, text: `${title}\n${desc}\n${fieldsText}` });
+      const footerText = emb.footer?.text || "";
+      blocks.push({ title, text: `${title}\n${desc}\n${fieldsText}\n${footerText}` });
     }
   }
 
   for (const block of blocks) {
-    if (!/gp\s*farm\s*host|monitor\s*link\s*on|shared\s*accounts/i.test(block.text)) continue;
+    if (!/gp\s*farm\s*host|monitor\s*link\s*on|shared\s*accounts|own\s*accounts/i.test(block.text)) continue;
 
     let hostName = "Farm Host";
-    const hostMatch = block.title.match(/([a-zA-Z0-9_-]+)\s*[—\-]\s*GP\s*farm\s*host/i) ||
-                      block.text.match(/([a-zA-Z0-9_-]+)\s*[—\-]\s*GP\s*farm\s*host/i);
+    const hostMatch =
+      block.title.match(/([a-zA-Z0-9_-]+)\s*[—–\-]\s*GP\s*farm\s*host/i) ||
+      block.text.match(/([a-zA-Z0-9_-]+)\s*[—–\-]\s*GP\s*farm\s*host/i);
     if (hostMatch) hostName = hostMatch[1].trim();
 
     const lines = block.text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
     for (const line of lines) {
+      if (/monitor\s*link\s*on/i.test(line) && /ready\s*\/?\s*total/i.test(line)) continue;
+
       const isGreen =
-        line.startsWith("🟢") ||
-        line.startsWith(":green_circle:") ||
-        /^<a?:green[a-z0-9_]*:\d+>/i.test(line);
+        /^(?:🟢|🟩|:green_circle:|<a?:[a-z0-9_]*green[a-z0-9_]*:\d+>)/i.test(line);
 
       if (!isGreen) continue;
 
-      let rest = line
-        .replace(/^(?:🟢|:green_circle:|<a?:[a-z0-9_]+:\d+>)\s*/i, "")
+      const rest = line
+        .replace(/^(?:🟢|🟩|:green_circle:|<a?:[a-z0-9_]+:\d+>)\s*/i, "")
         .trim();
 
       let mentionedDiscordId = null;
-      const mentionMatch = rest.match(/^<@!?(\d{17,20})>/);
+      const mentionMatch = rest.match(/<@!?(\d{17,20})>/);
       if (mentionMatch) {
         mentionedDiscordId = mentionMatch[1];
       }
 
-      // Extraer el nombre antes del guion "— 905/1285"
-      const parts = rest.split(/\s+[—–\-]\s+/);
-      let rawUserPart = (parts[0] || "").replace(/^@+/, "").trim();
+      const parts = rest.split(/\s+[—–\-]\s+|\s+-\s+/);
+      const rawUserPart = (parts[0] || "")
+        .replace(/<@!?\d{17,20}>/g, "")
+        .replace(/^@+/, "")
+        .trim();
+
       let ready = 0;
       let total = 0;
-
-      if (parts[1]) {
-        const countMatch = parts[1].replace(/\*/g, "").match(/(\d+)\s*\/\s*(\d+)/);
-        if (countMatch) {
-          ready = Number(countMatch[1]) || 0;
-          total = Number(countMatch[2]) || 0;
-        }
+      const countSource = parts[1] || rest;
+      const countMatch = countSource.replace(/\*/g, "").match(/(\d+)\s*\/\s*(\d+)/);
+      if (countMatch) {
+        ready = Number(countMatch[1]) || 0;
+        total = Number(countMatch[2]) || 0;
       }
 
       entries.push({
@@ -362,69 +334,73 @@ async function scanFarmHostSharingPanel() {
   try {
     const candidateChannels = new Map();
 
-    // 1. Canal configurado directamente
     if (FARM_HOST_CHANNEL_ID) {
       const ch = await client.channels.fetch(FARM_HOST_CHANNEL_ID).catch(() => null);
       if (ch && ch.isTextBased()) candidateChannels.set(ch.id, ch);
     }
 
-    // 2. Búsqueda de respaldo en los canales de texto del servidor por si está en otro canal
     const guild = client.guilds.cache.first();
     if (guild) {
+      await guild.members.fetch().catch(() => {});
       for (const ch of guild.channels.cache.values()) {
         if (
           ch.isTextBased() &&
-          /farm|host|share|sharing|arcade|monitor|status|panel|alert/i.test(ch.name)
+          /farm|host|share|sharing|arcade|monitor|status|panel|alert|gp/i.test(ch.name)
         ) {
           candidateChannels.set(ch.id, ch);
         }
       }
     }
 
-    const greenEntries = [];
+    // Mantenemos únicamente el último mensaje más reciente de cada host (ej: Arcade, wR98)
+    const latestHostEntries = new Map();
 
     for (const ch of candidateChannels.values()) {
-      const msgs = await ch.messages.fetch({ limit: 35 }).catch(() => null);
+      const msgs = await ch.messages.fetch({ limit: 40 }).catch(() => null);
       if (!msgs) continue;
 
-      for (const msg of msgs.values()) {
+      const sortedMsgs = Array.from(msgs.values()).sort((a, b) => b.createdTimestamp - a.createdTimestamp);
+      for (const msg of sortedMsgs) {
         const parsed = parseFarmHostPanelMessage(msg);
         if (parsed.length > 0) {
-          greenEntries.push(...parsed);
-        }
-      }
-      // Si ya encontramos el panel en el canal principal, no hace falta seguir buscando
-      if (greenEntries.length > 0 && ch.id === FARM_HOST_CHANNEL_ID) break;
-    }
-
-    // Cargar todos los usuarios registrados (Elite_Four, Rivals, Gym_Leader, Trainer)
-    const allRegisteredUsers = new Map();
-    const groupsToLoad = ["Elite_Four", "Rivals", "Gym_Leader", "Trainer"];
-
-    for (const grp of groupsToLoad) {
-      const gUsers = await getUsers(grp);
-      for (const [uid, uData] of Object.entries(gUsers)) {
-        if (!allRegisteredUsers.has(String(uid))) {
-          allRegisteredUsers.set(String(uid), uData);
-        } else {
-          const existing = allRegisteredUsers.get(String(uid));
-          allRegisteredUsers.set(String(uid), { ...uData, ...existing });
-        }
-      }
-    }
-
-    // También incluir miembros de sesiones activas de Rivals
-    for (const grp of Object.keys(GROUP_CONFIG)) {
-      const sessions = await getRivalsSessionsByGroup(grp);
-      for (const s of sessions) {
-        for (const m of s.members || []) {
-          if (m.discordId && !allRegisteredUsers.has(String(m.discordId))) {
-            allRegisteredUsers.set(String(m.discordId), {
-              name: m.name,
-              heartbeatName: m.heartbeatName || m.name
-            });
+          for (const item of parsed) {
+            const hKey = item.hostName.toLowerCase();
+            if (!latestHostEntries.has(hKey)) {
+              latestHostEntries.set(hKey, { msgId: msg.id, list: [] });
+            }
+            if (latestHostEntries.get(hKey).msgId === msg.id) {
+              latestHostEntries.get(hKey).list.push(item);
+            }
           }
         }
+      }
+      if (latestHostEntries.size > 0 && ch.id === FARM_HOST_CHANNEL_ID) break;
+    }
+
+    const greenEntries = [];
+    for (const hostGroup of latestHostEntries.values()) {
+      greenEntries.push(...hostGroup.list);
+    }
+
+    // Cargar todos los usuarios registrados en Elite_Four y Gym_Leader
+    const allRegisteredUsers = new Map();
+    for (const grp of Object.keys(GROUP_CONFIG)) {
+      const gUsers = await getUsers(grp);
+      for (const [uid, uData] of Object.entries(gUsers)) {
+        const existing = allRegisteredUsers.get(String(uid)) || {};
+        const member = guild?.members?.cache?.get(String(uid));
+        const extraAliases = member
+          ? [member.displayName, member.user.username, member.user.globalName].filter(Boolean)
+          : [];
+        allRegisteredUsers.set(String(uid), {
+          ...uData,
+          ...existing,
+          aliases: [
+            ...(Array.isArray(uData.aliases) ? uData.aliases : []),
+            ...(Array.isArray(existing.aliases) ? existing.aliases : []),
+            ...extraAliases
+          ]
+        });
       }
     }
 
@@ -433,27 +409,13 @@ async function scanFarmHostSharingPanel() {
     for (const entry of greenEntries) {
       let matchedDiscordId = null;
 
-      // A. Si el panel tenía mención directa <@ID>
+      // 1. Coincidencia directa por mención <@ID>
       if (entry.mentionedDiscordId && allRegisteredUsers.has(String(entry.mentionedDiscordId))) {
         matchedDiscordId = String(entry.mentionedDiscordId);
-      } else if (entry.mentionedDiscordId && guild) {
-        // Si es una mención pero necesitamos su nombre de usuario de Discord para comparar con los registros
-        const member =
-          guild.members.cache.get(entry.mentionedDiscordId) ||
-          (await guild.members.fetch(entry.mentionedDiscordId).catch(() => null));
-        if (member) {
-          const memberNames = [member.displayName, member.user.username, member.user.globalName].filter(Boolean);
-          for (const [uid, uData] of allRegisteredUsers.entries()) {
-            if (memberNames.some((mName) => isFuzzyUserMatch(mName, uData, 0.78))) {
-              matchedDiscordId = String(uid);
-              break;
-            }
-          }
-        }
       }
 
-      // B. Comparación difusa por nombre visible (@creeeder91 vs creeder, @HT vs HT, etc.)
-      if (!matchedDiscordId && entry.rawName && !entry.rawName.startsWith("<@")) {
+      // 2. Coincidencia difusa por nombre en el panel (@creeeder91 -> creeder, etc.)
+      if (!matchedDiscordId && entry.rawName) {
         let bestUid = null;
         let bestScore = 0;
 
@@ -461,7 +423,7 @@ async function scanFarmHostSharingPanel() {
           const candidates = getUserNameCandidates(uData);
           for (const cand of candidates) {
             const score = calculateNameSimilarity(entry.rawName, cand);
-            if (score >= 0.78 && score > bestScore) {
+            if (score >= 0.76 && score > bestScore) {
               bestScore = score;
               bestUid = String(uid);
             }
@@ -475,6 +437,7 @@ async function scanFarmHostSharingPanel() {
 
       if (matchedDiscordId) {
         const current = newSharingMap.get(matchedDiscordId) || {
+          type: "accounts",
           hosts: [],
           ready: 0,
           total: 0
@@ -488,6 +451,21 @@ async function scanFarmHostSharingPanel() {
       }
     }
 
+    // 3. Incluir también usuarios con rol Legend como "proxies" en el mapa de protección
+    if (guild) {
+      for (const [uid] of allRegisteredUsers.entries()) {
+        const member = guild.members.cache.get(String(uid));
+        if (member && hasLegendRole(member) && !newSharingMap.has(String(uid))) {
+          newSharingMap.set(String(uid), {
+            type: "proxies",
+            hosts: ["Legend Proxy Node"],
+            ready: 0,
+            total: 0
+          });
+        }
+      }
+    }
+
     activeSharingUsersMap.clear();
     const redisPayload = {};
     for (const [uid, info] of newSharingMap.entries()) {
@@ -496,13 +474,13 @@ async function scanFarmHostSharingPanel() {
     }
 
     await redis.set(SHARING_USERS_KEY, JSON.stringify(redisPayload)).catch(() => {});
-    console.log(`🔄 [Farm Host Scanner] Active sharing users detected (🟢): ${activeSharingUsersMap.size}`);
+    console.log(`🔄 [Host & Proxy Scanner] Active sharing users detected: ${activeSharingUsersMap.size}`);
   } catch (err) {
     console.error("❌ Error scanning GP Farm Host panel:", err);
   }
 }
 
-// ================= FETCH MESSAGES & MULTI-PC PARSERS =================
+// ================= FETCH MESSAGES & HEARTBEAT PARSERS =================
 
 async function fetchMessagesByHours(channel, hours) {
   const all = [];
@@ -531,25 +509,16 @@ async function fetchMessagesByHours(channel, hours) {
   return all.sort((a, b) => b.createdTimestamp - a.createdTimestamp);
 }
 
-function cleanList(str) {
-  if (!str) return [];
-  return str.split(",").map((x) => x.trim()).filter(Boolean);
-}
-
 function parseStats(content) {
   const text = String(content || "");
   const timeMatch = text.match(/Time:\s*([^\n\r]+?)\s+Packs:/i);
   const packsMatch = text.match(/Packs:\s*(\d+)/i);
   const avgMatch = text.match(/Avg:\s*([\d.]+)\s*packs?\s*\/?\s*min/i) || text.match(/Avg:\s*([\d.]+)/i);
-  const onlineMatch = text.match(/Online:\s*([^\n\r]+)/i);
-  const offlineMatch = text.match(/Offline:\s*([^\n\r]+)/i);
 
   return {
     time: timeMatch?.[1]?.trim() || "0m",
     packs: Number(packsMatch?.[1] || 0),
-    ppm: Number(avgMatch?.[1] || 0),
-    online: cleanList(onlineMatch?.[1]),
-    offline: cleanList(offlineMatch?.[1])
+    ppm: Number(avgMatch?.[1] || 0)
   };
 }
 
@@ -650,8 +619,6 @@ function mergeStatsFromMessages(messages) {
     time: "0m",
     packs: 0,
     ppm: 0,
-    online: [],
-    offline: [],
     pcCount: messages.length
   };
 
@@ -665,16 +632,9 @@ function mergeStatsFromMessages(messages) {
     if (stats.time && stats.time !== "0" && stats.time !== "0m") {
       merged.time = stats.time;
     }
-    if (Array.isArray(stats.online)) {
-      merged.online.push(...stats.online);
-    }
-    if (Array.isArray(stats.offline) && !stats.offline.includes("none")) {
-      merged.offline.push(...stats.offline);
-    }
   }
 
   merged.ppm = Number(merged.ppm.toFixed(2));
-  if (!merged.offline.length) merged.offline = ["none"];
   return merged;
 }
 
@@ -687,36 +647,25 @@ function buildPowerBar(currentPPM, maxExpectedPPM = 120) {
   return "▰".repeat(filled) + "▱".repeat(length - filled);
 }
 
-function calculateGlobalStats(onlineStats) {
+function calculateGlobalStats(onlineStats, sharingAccountsCount, sharingProxiesCount) {
   let totalPPM = 0;
-  let totalInstances = 0;
-  let activeInstances = 0;
   let totalPacks = 0;
 
   for (const s of onlineStats) {
     totalPPM += Number(s.ppm) || 0;
-    const onlineCount = s.online.filter((x) => x.toLowerCase() !== "main" && x.toLowerCase() !== "none").length;
-    const offlineCount = s.offline.includes("none") ? 0 : s.offline.filter((x) => x.toLowerCase() !== "main").length;
-
-    activeInstances += onlineCount;
-    totalInstances += onlineCount + offlineCount;
     totalPacks += Number(s.packs) || 0;
   }
 
   const users = onlineStats.length;
-  const efficiency = totalInstances > 0 ? Math.round((activeInstances / totalInstances) * 100) : 0;
 
   return {
     rawTotalPPM: totalPPM,
     totalPPM: totalPPM.toFixed(2),
     avgPPM: (users ? totalPPM / users : 0).toFixed(2),
-    activeInstances,
-    totalInstances,
-    efficiency,
-    instancesDisplay: `${activeInstances}/${totalInstances} (${efficiency}%)`,
-    avgInstances: (users ? (activeInstances / users).toFixed(1) : "0.0"),
     totalPacks,
     users,
+    sharingAccountsCount,
+    sharingProxiesCount,
     minutesToGP: totalPPM > 0 ? (2000 / totalPPM).toFixed(1) : "∞",
     gpPerHour: totalPPM > 0 ? (60 / (2000 / totalPPM)).toFixed(2) : "0.00"
   };
@@ -779,14 +728,14 @@ async function checkAndTriggerMassiveRerollAlert(group, channel, highPpmUsers) {
 
   const config = GROUP_CONFIG[group];
   const turboList = triggered
-    .map((u) => `🔥 **${u.name}** — \`⚡ ${u.ppm.toFixed(2)} PPM\` (\`🖥️ ${u.activeInstances} active instances\`)`)
+    .map((u) => `🔥 **${u.name}** — \`⚡ ${u.ppm.toFixed(2)} PPM\``)
     .join("\n");
 
   const alertEmbed = new EmbedBuilder()
     .setColor(0xff2a85)
     .setTitle(`🚨 MASSIVE REROLL ACTIVATED IN ${config.label.toUpperCase()}! 🚨`)
     .setDescription(
-      `Hight pack-opening speed has been detected right now!\n\n` +
+      `High pack-opening speed has been detected right now!\n\n` +
       `${turboList}\n\n` +
       `⚡ **Jump in, set your account ONLINE, and join the God Pack wave!**`
     )
@@ -798,24 +747,24 @@ async function checkAndTriggerMassiveRerollAlert(group, channel, highPpmUsers) {
   }
 }
 
-// ================= PANEL GENERATOR (ONLINE USERS ONLY + GLOBAL STATS) =================
+// ================= PANEL GENERATOR (HEADLESS + SHARING ACCOUNTS / PROXIES) =================
 
 async function generatePanel(group, panelChannel) {
   const config = GROUP_CONFIG[group];
   const users = await getUsers(group);
-  const rivalsUsers = await getUsers("Rivals");
   const onlineIds = new Set((await getOnlineIDs(group)).map(normalizeId));
-  const rivalsSessions = await getRivalsSessionsByGroup(group);
   const farmMode = await isFarmModeActive();
 
+  const guild = panelChannel?.guild || client.guilds.cache.first();
   const heartbeatChannel = await client.channels.fetch(config.heartbeatChannelId).catch(() => null);
   const messages = heartbeatChannel ? await fetchMessagesByHours(heartbeatChannel, 4) : [];
 
   const onlineStats = [];
   const processedOnlineUsers = [];
   const highPpmUsers = [];
-  const countedDiscordIds = new Set();
-  
+  let sharingAccountsCount = 0;
+  let sharingProxiesCount = 0;
+
   const now = Date.now();
 
   let lastStopData = {};
@@ -824,7 +773,6 @@ async function generatePanel(group, panelChannel) {
     if (rawStops && typeof rawStops === "object") lastStopData = rawStops;
   } catch (err) {}
 
-  // 1. Standard Group Online Users
   for (const [discordId, rawUser] of Object.entries(users)) {
     const mainId = normalizeId(rawUser.main_id);
     const secId = normalizeId(rawUser.sec_id);
@@ -832,103 +780,55 @@ async function generatePanel(group, panelChannel) {
 
     if (!isOnline) continue;
 
-    const sharingInfo = activeSharingUsersMap.get(String(discordId)) || null;
-    const isSharing = Boolean(sharingInfo);
+    // Verificar si el usuario tiene el rol Legend -> Sharing Proxies
+    const member =
+      guild?.members?.cache?.get(String(discordId)) ||
+      (guild ? await guild.members.fetch(String(discordId)).catch(() => null) : null);
+    const isLegendProxy = hasLegendRole(member);
+
+    // Verificar si está en el panel GP Farm Host -> Sharing Accounts
+    const hostShareInfo = activeSharingUsersMap.get(String(discordId)) || null;
+    const isAccountSharing = Boolean(hostShareInfo && hostShareInfo.type === "accounts");
+
+    let shareMode = null; // "proxies" | "accounts" | null
+    if (isLegendProxy) {
+      shareMode = "proxies";
+      sharingProxiesCount++;
+    } else if (isAccountSharing) {
+      shareMode = "accounts";
+      sharingAccountsCount++;
+    }
 
     const userMessages = findLastMessagesForUserMultiPC(messages, rawUser);
     const userLastStop = Number(lastStopData[discordId]) || 0;
-    
-    const validMessages = userMessages.filter(msg => 
-      (now - msg.createdTimestamp) <= HEARTBEAT_TIMEOUT_MS &&
-      msg.createdTimestamp > userLastStop
+
+    const validMessages = userMessages.filter(
+      (msg) =>
+        now - msg.createdTimestamp <= HEARTBEAT_TIMEOUT_MS &&
+        msg.createdTimestamp > userLastStop
     );
 
-    const stats = (!isSharing && validMessages.length)
-      ? mergeStatsFromMessages(validMessages)
-      : { time: "0m", packs: 0, ppm: 0, online: [], offline: ["none"], pcCount: 0 };
+    const stats =
+      !shareMode && validMessages.length
+        ? mergeStatsFromMessages(validMessages)
+        : { time: "0m", packs: 0, ppm: 0, pcCount: 0 };
 
     onlineStats.push(stats);
-    countedDiscordIds.add(String(discordId));
-
-    const activeInst = stats.online.filter((x) => x.toLowerCase() !== "main" && x.toLowerCase() !== "none").length;
-    const offlineInst = stats.offline.includes("none") ? 0 : stats.offline.filter((x) => x.toLowerCase() !== "main").length;
 
     processedOnlineUsers.push({
       discordId,
       name: rawUser.name || "Unknown",
       stats,
-      activeInst,
-      offlineInst,
-      isRival: false,
-      rivalTag: "",
-      isSharing,
-      sharingInfo
+      shareMode,
+      hostShareInfo
     });
 
-    if (!isSharing && stats.ppm > MASSIVE_PPM_THRESHOLD) {
+    if (!shareMode && stats.ppm > MASSIVE_PPM_THRESHOLD) {
       highPpmUsers.push({
         discordId,
         name: rawUser.name || "Unknown",
-        ppm: stats.ppm,
-        activeInstances: activeInst
+        ppm: stats.ppm
       });
-    }
-  }
-
-  // 2. Rivals 2.0 Sessions Active in this Group
-  for (const session of rivalsSessions) {
-    for (let idx = 0; idx < session.members.length; idx++) {
-      const member = session.members[idx];
-      if (countedDiscordIds.has(String(member.discordId))) continue;
-
-      const rivalUserData = rivalsUsers[member.discordId] || {
-        name: member.name,
-        heartbeatName: member.heartbeatName || member.name,
-        main_id: member.gameId
-      };
-
-      const sharingInfo = activeSharingUsersMap.get(String(member.discordId)) || null;
-      const isSharing = Boolean(sharingInfo);
-
-      const userMessages = findLastMessagesForUserMultiPC(messages, rivalUserData);
-      const userLastStop = Number(lastStopData[member.discordId]) || 0;
-      
-      const validMessages = userMessages.filter(msg => 
-        (now - msg.createdTimestamp) <= HEARTBEAT_TIMEOUT_MS &&
-        msg.createdTimestamp > userLastStop
-      );
-
-      const stats = (!isSharing && validMessages.length)
-        ? mergeStatsFromMessages(validMessages)
-        : { time: "0m", packs: 0, ppm: 0, online: [], offline: ["none"], pcCount: 0 };
-
-      onlineStats.push(stats);
-      countedDiscordIds.add(String(member.discordId));
-
-      const activeInst = stats.online.filter((x) => x.toLowerCase() !== "main" && x.toLowerCase() !== "none").length;
-      const offlineInst = stats.offline.includes("none") ? 0 : stats.offline.filter((x) => x.toLowerCase() !== "main").length;
-      const isTurnActive = session.activeIndex === idx;
-
-      processedOnlineUsers.push({
-        discordId: member.discordId,
-        name: rivalUserData.name || member.name || "Rival",
-        stats,
-        activeInst,
-        offlineInst,
-        isRival: true,
-        rivalTag: isTurnActive ? "🤝 Rivals • 🟢 Active Turn" : "🤝 Rivals • ⏳ Standby",
-        isSharing,
-        sharingInfo
-      });
-
-      if (!isSharing && stats.ppm > MASSIVE_PPM_THRESHOLD) {
-        highPpmUsers.push({
-          discordId: member.discordId,
-          name: rivalUserData.name || member.name || "Rival",
-          ppm: stats.ppm,
-          activeInstances: activeInst
-        });
-      }
     }
   }
 
@@ -936,34 +836,39 @@ async function generatePanel(group, panelChannel) {
     await checkAndTriggerMassiveRerollAlert(group, panelChannel, highPpmUsers);
   }
 
-  // Ordenar: primero los usuarios con packs/PPM más altos, luego los que están en modo Sharing
+  // Ordenar: primero los usuarios con packs/PPM, luego Sharing Proxies y Sharing Accounts
   processedOnlineUsers.sort((a, b) => {
-    if (a.isSharing !== b.isSharing) return a.isSharing ? 1 : -1;
+    const aIsSharing = Boolean(a.shareMode);
+    const bIsSharing = Boolean(b.shareMode);
+    if (aIsSharing !== bIsSharing) return aIsSharing ? 1 : -1;
     return b.stats.packs - a.stats.packs || b.stats.ppm - a.stats.ppm;
   });
 
-  const onlineLines = processedOnlineUsers.map((u, index) => {
-    const rankIcon = index === 0 ? "🥇" : index === 1 ? "🥈" : index === 2 ? "🥉" : "⚔️";
-    const rivalBadge = u.isRival ? ` *(${u.rivalTag})*` : "";
-
-    // Si el usuario tiene el círculo verde en el panel de GP Farm Host (Sharing)
-    if (u.isSharing) {
+  const onlineLines = processedOnlineUsers.map((u) => {
+    if (u.shareMode === "proxies") {
       return (
-        `🎲 **${u.name}**${rivalBadge} \`🟢 SHARING\`\n` +
-        `┗ 🔗 \`Account Sharing Active\`  •  🖥️ \`GP Farm Host (Monitor Link ON)\``
+        `🌐 **${u.name}** \`🟣 SHARING PROXIES\`\n` +
+        `┗ 🔗 \`Sharing Proxies Active\`  •  ⚡ \`Headless Proxy Node ON\``
       );
     }
 
-    const multiPcTag = u.stats.pcCount > 1 ? " `🖥️ 2-PC`" : "";
+    if (u.shareMode === "accounts") {
+      return (
+        `🎲 **${u.name}** \`🟢 SHARING ACCOUNTS\`\n` +
+        `┗ 🔗 \`Sharing Accounts Active\`  •  🖥️ \`GP Farm Host (Monitor Link ON)\``
+      );
+    }
+
+    const multiPcTag = u.stats.pcCount > 1 ? " `🖥️ 2-Nodes`" : "";
     const turboIcon = u.stats.ppm > MASSIVE_PPM_THRESHOLD ? " 🔥" : "";
 
     return (
-      `${rankIcon} **${u.name}**${multiPcTag}${rivalBadge}${turboIcon}\n` +
-      `┗ ⚡ \`${u.stats.ppm.toFixed(2)} PPM\`  •  🀄 \`${u.stats.packs.toLocaleString()}\`  •  ⏱️ \`${u.stats.time}\`  •  🖥️ \`${u.activeInst}\`  •  💤 \`${u.offlineInst}\``
+      `⚡ **${u.name}**${multiPcTag}${turboIcon}\n` +
+      `┗ ⚡ \`${u.stats.ppm.toFixed(2)} PPM\`  •  🀄 \`${u.stats.packs.toLocaleString()} Packs\`  •  ⏱️ \`${u.stats.time}\``
     );
   });
 
-  const global = calculateGlobalStats(onlineStats);
+  const global = calculateGlobalStats(onlineStats, sharingAccountsCount, sharingProxiesCount);
   const gp = formatGPStats(await getLiveStats(group));
   const cachedAvgPPM = await refreshAveragePPM(group);
   const powerBar = buildPowerBar(global.rawTotalPPM, 120);
@@ -971,10 +876,14 @@ async function generatePanel(group, panelChannel) {
   let tierBadge = "🟢 **STANDARD MODE**";
   if (global.rawTotalPPM >= 40) tierBadge = "🔥 **OVERDRIVE MODE**";
   else if (global.rawTotalPPM >= 30) tierBadge = "⚡ **HIGH SPEED REROLL**";
-  else if (global.rawTotalPPM === 0) tierBadge = "💤 **IDLE / WAITING**";
+  else if (global.rawTotalPPM === 0 && (sharingAccountsCount > 0 || sharingProxiesCount > 0)) {
+    tierBadge = "🎲 **HOST & PROXY SHARING ACTIVE**";
+  } else if (global.rawTotalPPM === 0) {
+    tierBadge = "💤 **IDLE / WAITING**";
+  }
 
   const farmBanner = farmMode
-    ? "\n> 🌾 **FARM MODE ACTIVE:** *Inactivity & low-instance kick timers are paused by Champion.*\n"
+    ? "\n> 🌾 **FARM MODE ACTIVE:** *Inactivity kick timers are paused by Champion.*\n"
     : "";
 
   const usersEmbed = new EmbedBuilder()
@@ -987,7 +896,7 @@ async function generatePanel(group, panelChannel) {
     );
 
   const globalEmbed = new EmbedBuilder()
-    .setTitle(`📊 Global Telemetry — ${config.label}`)
+    .setTitle(`📊 Global Headless Telemetry — ${config.label}`)
     .setColor(farmMode ? 0xf1c40f : config.color)
     .setDescription(
       `${farmBanner}` +
@@ -999,15 +908,15 @@ async function generatePanel(group, panelChannel) {
       { name: "👥 Online Users", value: `**${global.users}**`, inline: true },
       { name: "🀄 Session Packs", value: `**${global.totalPacks.toLocaleString()}**`, inline: true },
       { name: "⚡ Avg PPM / User", value: `**${global.avgPPM}**`, inline: true },
-      { name: "🖥️ Active Instances", value: `**${global.instancesDisplay}**`, inline: true },
-      { name: "📊 Avg Inst / User", value: `**${global.avgInstances}**`, inline: true },
+      { name: "🎲 Sharing Accounts", value: `**${global.sharingAccountsCount}**`, inline: true },
+      { name: "🌐 Sharing Proxies", value: `**${global.sharingProxiesCount}**`, inline: true },
       { name: "🎯 Est. GP / Hour", value: `**${global.gpPerHour}**`, inline: true },
       { name: "⏱️ Est. Min / GP", value: `**${global.minutesToGP} min**`, inline: true },
       { name: "🌟 GP Today", value: `**${gp.todayGP} GP**\n💖 **${gp.todayAlive} Alive** (\`${gp.todayRate}%\`)`, inline: true },
       { name: "💫 Total (5 Days)", value: `**${gp.totalGP} GP**\n💖 **${gp.totalAlive} Alive**`, inline: true },
       { name: "📅 Last 5 Days History", value: gp.historyText, inline: false }
     )
-    .setFooter({ text: "Auto-updates every 5 mins • Multi-PC, Rivals 2.0 & Account Sharing Enabled" })
+    .setFooter({ text: "Auto-updates every 5 mins • Headless System (Accounts & Proxies Sharing)" })
     .setTimestamp();
 
   return {
@@ -1096,9 +1005,11 @@ client.on("messageCreate", async (message) => {
 
     try {
       await redis.hset("last_stopppm", { [targetUser.id]: Date.now() });
-      
-      await message.reply(`✅ El PPM y las instancias de **${targetUser.username}** han sido forzados a **0**.\n*(Sus reportes anteriores han sido invalidados. Si envía un nuevo heartbeat, el panel volverá a contar desde cero).*`);
-      
+
+      await message.reply(
+        `✅ El PPM de **${targetUser.username}** ha sido forzado a **0**.\n*(Sus reportes anteriores han sido invalidados. Si envía un nuevo heartbeat, el panel volverá a contar desde cero).*`
+      );
+
       updateAllPanels();
     } catch (err) {
       console.error("Error al usar !stopppm:", err);
@@ -1107,11 +1018,12 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-// ================= LOAD ALERTS & RANKING MODULES =================
+// ================= LOAD ALERTS MODULE (RANKING REMOVED) =================
 
 require("./alerts")(client, {
   GROUP_CONFIG,
   CHAMPION_ROLE_ID,
+  LEGEND_ROLE_ID,
   PUBLIC_ALERTS_CHANNEL_ID,
   FARM_HOST_CHANNEL_ID,
   GLOBAL_HEARTBEAT_CHANNEL_ID,
@@ -1120,27 +1032,18 @@ require("./alerts")(client, {
   onFarmModeChanged: updateAllPanels
 });
 
-require("./ranking")(client, {
-  GROUP_CONFIG,
-  CHAMPION_ROLE_ID,
-  GLOBAL_HEARTBEAT_CHANNEL_ID,
-  redis
-});
-
 // ================= START =================
 
 client.once("ready", async () => {
-  console.log(`✅ Telemetry, Alerts & Ranking Bot connected as: ${client.user.tag}`);
+  console.log(`✅ Headless Telemetry & Alerts Bot connected as: ${client.user.tag}`);
 
   client.statsPanelMessages = new Map();
   client.lastTotalPPMByGroup = new Map();
 
-  // Escaneo inicial del panel de GP Farm Host (Sharing) y actualización de paneles
   await scanFarmHostSharingPanel();
   await updateAllPanels();
   await storeAllPPM();
 
-  // Escanear el panel de GP Farm Host cada 20 minutos
   setInterval(async () => {
     await scanFarmHostSharingPanel();
     await updateAllPanels();
