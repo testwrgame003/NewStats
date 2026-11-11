@@ -8,25 +8,21 @@ const {
 const ENABLE_DOUBLE_REROLL_ALERTS = false; // 🛑 Cambia a true para REACTIVAR la detección de Double Reroll
 
 const PERSONAL_CHANNELS_CATEGORY_ID = "1565623831203287150";
-const REQUIRED_ACTIVE_INSTANCES = 2;
-const LOW_INSTANCES_TIMEOUT_MS = 45 * 60 * 1000;
-const LOW_INSTANCES_WARNING_INTERVAL_MS = 10 * 60 * 1000;
 const HEARTBEAT_SILENCE_TIMEOUT_MS = 40 * 60 * 1000;
 const ONLINE_GRACE_PERIOD_MS = 15 * 60 * 1000; // 15 minutos de gracia para el primer heartbeat
 
-const RIVALS_SESSIONS_KEY = "rivals_sessions";
 const PERSONAL_STATE_KEY = "personal_channel_state";
 const FARM_MODE_KEY = "system:farm_mode";
 const SHARING_USERS_KEY = "active_sharing_users";
 
-const crashTimers = new Map();
 const USERS_CACHE = new Map();
 const USERS_CACHE_TTL = 2 * 60 * 1000;
 const MULTI_PC_CACHE = new Map();
 
 // ================= REDIS HELPERS =================
 
-const usersKey = (group) => `users:${group}`; const onlineKey = (group) => `online:${group}`;
+const usersKey = (group) => `users:${group}`;
+const onlineKey = (group) => `online:${group}`;
 
 function safeJsonParse(value, fallback = {}) {
   try {
@@ -72,6 +68,12 @@ function namesMatchMultiPC(heartbeatName, registeredName) {
   return false;
 }
 
+function hasLegendRole(member, legendRoleId) {
+  if (!member?.roles?.cache) return false;
+  if (legendRoleId && member.roles.cache.has(legendRoleId)) return true;
+  return member.roles.cache.some((r) => r.name.trim().toLowerCase() === "legend");
+}
+
 async function isFarmModeActive(redis) {
   try {
     const val = await redis.get(FARM_MODE_KEY);
@@ -102,7 +104,6 @@ async function getPersonalState(redis, discordId) {
       heartbeatMsgId: null,
       offlineMsgId: null,
       kickReasonMsgId: null,
-      warningMsgIds: [],
       wasOnline: false,
       onlineSince: 0,
       lastOnlineGroup: null,
@@ -114,7 +115,6 @@ async function getPersonalState(redis, discordId) {
       heartbeatMsgId: null,
       offlineMsgId: null,
       kickReasonMsgId: null,
-      warningMsgIds: [],
       wasOnline: false,
       onlineSince: 0,
       lastOnlineGroup: null,
@@ -176,14 +176,11 @@ function isUserOnlineInGroup(userData, onlineIds) {
   return getUserGameIds(userData).some((id) => set.has(id));
 }
 
-// Busca a qué usuario pertenece un ID de juego de 16 dígitos en todos los registros
 async function findUserByGameId(redis, GROUP_CONFIG, targetGameId) {
   const cleanTarget = normalizeId(targetGameId);
   if (!/^\d{16}$/.test(cleanTarget)) return null;
 
-  const groupsToSearch = [...Object.keys(GROUP_CONFIG), "Rivals"];
-
-  for (const group of groupsToSearch) {
+  for (const group of Object.keys(GROUP_CONFIG)) {
     const users = await loadUsers(redis, group);
     for (const [discordId, uData] of Object.entries(users)) {
       const gameIds = getUserGameIds(uData);
@@ -192,89 +189,10 @@ async function findUserByGameId(redis, GROUP_CONFIG, targetGameId) {
       }
     }
   }
-
-  // Buscar también en las sesiones activas de Rivals
-  const rivalsSessions = await getAllRivalsSessions(redis);
-  for (const sess of rivalsSessions) {
-    for (const m of sess.members || []) {
-      if (normalizeId(m.gameId) === cleanTarget) {
-        return {
-          discordId: String(m.discordId),
-          userData: {
-            name: m.name,
-            heartbeatName: m.heartbeatName || m.name,
-            main_id: m.gameId
-          },
-          group: sess.targetGroup || "Rivals"
-        };
-      }
-    }
-  }
-
   return null;
 }
 
-// ================= RIVALS 2.0 INTEGRATION =================
-
-async function getAllRivalsSessions(redis) {
-  try {
-    const rawData = await redis.hgetall(RIVALS_SESSIONS_KEY);
-    if (!rawData || typeof rawData !== "object") return [];
-    const list = [];
-    for (const raw of Object.values(rawData)) {
-      const s = safeJsonParse(raw, null);
-      if (s && s.id && Array.isArray(s.members)) list.push(s);
-    }
-    return list;
-  } catch {
-    return [];
-  }
-}
-
-async function findRivalSessionByDiscordId(redis, discordId) {
-  const sessions = await getAllRivalsSessions(redis);
-  return sessions.find((s) => s.members.some((m) => String(m.discordId) === String(discordId))) || null;
-}
-
-async function removeUserFromRivalsSession(redis, client, discordId) {
-  const session = await findRivalSessionByDiscordId(redis, discordId);
-  if (!session) return false;
-
-  const idx = session.members.findIndex((m) => String(m.discordId) === String(discordId));
-  if (idx === -1) return false;
-
-  const removedMember = session.members[idx];
-  if (session.activeIndex === idx && removedMember?.gameId) {
-    await redis.srem(onlineKey(session.targetGroup), normalizeId(removedMember.gameId));
-  }
-
-  session.members.splice(idx, 1);
-
-  if (session.members.length === 0) {
-    await redis.hdel(RIVALS_SESSIONS_KEY, session.id);
-    return true;
-  }
-
-  session.activeIndex = 0;
-  session.lastRotationAt = Date.now();
-  session.ceded = {};
-  if (session.members[0]?.gameId) {
-    await redis.sadd(onlineKey(session.targetGroup), normalizeId(session.members[0].gameId));
-  }
-
-  await redis.hset(RIVALS_SESSIONS_KEY, { [session.id]: JSON.stringify(session) });
-
-  try {
-    const partner = await client.users.fetch(session.members[0].discordId);
-    await partner.send(
-      `⚠️ Your Rivals partner (<@${discordId}>) was set offline due to inactivity. You are now rerolling in **Solo Mode (1h ON, 1h OFF)**.`
-    );
-  } catch {}
-
-  return true;
-}
-
-// ================= HEARTBEAT PARSERS & MULTI-PC FUSION =================
+// ================= HEARTBEAT PARSERS (HEADLESS MODE) =================
 
 function getMessageText(message) {
   let content = message.content || "";
@@ -307,26 +225,17 @@ function parseSingleHeartbeat(content) {
   const avgMatch = text.match(/Avg:\s*([\d.]+)\s*packs?\s*\/?\s*min/i) || text.match(/Avg:\s*([\d.]+)/i);
   const typeMatch = text.match(/Type:\s*([^\n\r]+)/i);
   const onlineMatch = text.match(/Online:\s*([^\n\r]+)/i);
-  const offlineMatch = text.match(/Offline:\s*([^\n\r]+)/i);
 
   const onlineRaw = onlineMatch
     ? onlineMatch[1].split(",").map((x) => x.trim()).filter(Boolean)
     : [];
-  const offlineRaw = offlineMatch
-    ? offlineMatch[1].split(",").map((x) => x.trim()).filter(Boolean)
-    : [];
-
-  const activeNumeric = onlineRaw.filter((x) => x.toLowerCase() !== "main" && x.toLowerCase() !== "none" && /^\d+$/.test(x));
-  const offlineNumeric = offlineRaw.filter((x) => x.toLowerCase() !== "main" && x.toLowerCase() !== "none" && /^\d+$/.test(x));
   const mainOnline = onlineRaw.some((x) => x.toLowerCase() === "main");
 
   return {
     time: timeMatch?.[1]?.trim() || "0m",
     packs: Number(packsMatch?.[1] || 0),
     ppm: Number(avgMatch?.[1] || 0),
-    type: typeMatch?.[1]?.trim() || "Standard",
-    activeNumeric,
-    offlineNumeric,
+    type: typeMatch?.[1]?.trim() || "Headless",
     mainOnline
   };
 }
@@ -370,20 +279,14 @@ function updateAndMergeUserMultiPC(discordId, rawHbName, registeredUserData, con
   let latestTime = parsed.time;
   let typeStr = parsed.type;
   let mainOnline = false;
-  const activeInstances = [];
-  const offlineInstances = [];
   const activeSources = [];
 
-  for (const [k, v] of userMap.entries()) {
+  for (const [, v] of userMap.entries()) {
     totalPacks += v.stats.packs;
     totalPPM += v.stats.ppm;
     if (v.stats.time && v.stats.time !== "0m") latestTime = v.stats.time;
     if (v.stats.mainOnline) mainOnline = true;
     activeSources.push(v.rawName);
-
-    const prefix = userMap.size > 1 ? `${k}:#` : "#";
-    v.stats.activeNumeric.forEach((inst) => activeInstances.push(`${prefix}${inst}`));
-    v.stats.offlineNumeric.forEach((inst) => offlineInstances.push(`${prefix}${inst}`));
   }
 
   return {
@@ -392,70 +295,49 @@ function updateAndMergeUserMultiPC(discordId, rawHbName, registeredUserData, con
     time: latestTime,
     type: typeStr,
     mainOnline,
-    activeCount: activeInstances.length,
-    offlineCount: offlineInstances.length,
-    activeInstances,
-    offlineInstances,
     sources: activeSources
   };
 }
 
-function getCurrentActiveInstancesForUser(discordId) {
-  const userMap = MULTI_PC_CACHE.get(String(discordId));
-  if (!userMap) return 0;
-  const now = Date.now();
-  let total = 0;
-  for (const v of userMap.values()) {
-    if (now - v.ts <= 25 * 60 * 1000) {
-      total += v.stats.activeNumeric.length;
-    }
-  }
-  return total;
-}
-
-// ================= PERSONAL HEARTBEAT EMBED DESIGN =================
+// ================= PERSONAL HEARTBEAT EMBED DESIGN (HEADLESS) =================
 
 function buildPrettyHeartbeatEmbed({
   userData,
   groupLabel,
   merged,
-  isRival,
-  farmMode
+  farmMode,
+  shareMode
 }) {
-  const isHealthy = merged.activeCount >= REQUIRED_ACTIVE_INSTANCES;
-  const color = farmMode ? 0xf1c40f : isHealthy ? 0x00f59b : 0xff9f43;
+  const color = farmMode ? 0xf1c40f : shareMode === "proxies" ? 0x9b59b6 : 0x00f59b;
 
   const pcBadge =
     merged.sources.length > 1
-      ? `🖥️ **Multi-PC Fusion:** \`${merged.sources.join(" + ")}\``
+      ? `🖥️ **Multi-Node:** \`${merged.sources.join(" + ")}\``
       : `💻 **Node:** \`${merged.sources[0] || userData.heartbeatName || userData.name}\``;
 
-  const roleTag = isRival ? `${groupLabel} (🤝 Rivals Mode)` : groupLabel;
-  const healthBadge = farmMode
-    ? "🌾 FARM MODE (Protected)"
-    : isHealthy
-    ? "🟢 HEALTHY"
-    : `⚠️ LOW INSTANCES (${merged.activeCount}/${REQUIRED_ACTIVE_INSTANCES})`;
+  let statusBadge = "🟢 ACTIVE (HEADLESS)";
+  if (farmMode) statusBadge = "🌾 FARM MODE";
+  else if (shareMode === "proxies") statusBadge = "🟣 SHARING PROXIES";
+  else if (shareMode === "accounts") statusBadge = "🟢 SHARING ACCOUNTS";
 
-  const activeListStr = merged.activeInstances.length
-    ? merged.activeInstances.map((i) => `\`${i}\``).join(" ")
-    : "`None`";
-
-  const offlineListStr = merged.offlineInstances.length
-    ? merged.offlineInstances.map((i) => `\`${i}\``).join(" ")
-    : "`0`";
+  const modeValue =
+    shareMode === "proxies"
+      ? "`Sharing Proxies`"
+      : shareMode === "accounts"
+      ? "`Sharing Accounts`"
+      : `\`${merged.ppm.toFixed(2)} PPM\``;
 
   return new EmbedBuilder()
     .setColor(color)
     .setTitle(`📡 PERSONAL TELEMETRY — ${(userData.name || "REROLLER").toUpperCase()}`)
     .setDescription(
-      `> 🏷️ **Group:** **${roleTag}**  •  🛡️ **Status:** **${healthBadge}**\n` +
+      `> 🏷️ **Group:** **${groupLabel}**  •  🛡️ **Status:** **${statusBadge}**\n` +
       `> ${pcBadge}  •  🔄 **Updated:** <t:${Math.floor(Date.now() / 1000)}:R>`
     )
     .addFields(
       {
-        name: "⚡ Speed (PPM)",
-        value: `\`${merged.ppm.toFixed(2)} PPM\``,
+        name: shareMode ? "🔗 Sharing Mode" : "⚡ Speed (PPM)",
+        value: modeValue,
         inline: true
       },
       {
@@ -469,22 +351,12 @@ function buildPrettyHeartbeatEmbed({
         inline: true
       },
       {
-        name: `🟢 Active Instances (${merged.activeCount})`,
-        value: activeListStr,
-        inline: false
-      },
-      {
-        name: `💤 Offline Instances (${merged.offlineCount})`,
-        value: offlineListStr,
-        inline: true
-      },
-      {
         name: "🎯 Injection / Main",
         value: `Main: ${merged.mainOnline ? "🟢 Online" : "⚪ Standby"} • \`${merged.type}\``,
-        inline: true
+        inline: false
       }
     )
-    .setFooter({ text: "Live auto-overwriting panel • Keeps your personal channel clean" })
+    .setFooter({ text: "Live Headless Telemetry • Keeps your personal channel clean" })
     .setTimestamp();
 }
 
@@ -621,15 +493,6 @@ async function clearTransientMessagesOnOnline(channel, state) {
     changed = true;
   }
 
-  if (Array.isArray(state.warningMsgIds) && state.warningMsgIds.length > 0) {
-    for (const wId of state.warningMsgIds) {
-      const msg = await channel.messages.fetch(wId).catch(() => null);
-      if (msg) await msg.delete().catch(() => {});
-    }
-    state.warningMsgIds = [];
-    changed = true;
-  }
-
   return changed;
 }
 
@@ -656,187 +519,19 @@ async function sendLastOfflineCard(channel, state, userData, groupLabel) {
   }
 }
 
-// ================= LOW INSTANCES COUNTDOWN (< 2 INSTANCES) =================
-
-function cancelLowInstanceTimer(discordId) {
-  const key = `low_inst:${discordId}`;
-  const existing = crashTimers.get(key);
-  if (existing) {
-    clearInterval(existing.interval);
-    clearTimeout(existing.timeout);
-    crashTimers.delete(key);
-    return true;
-  }
-  return false;
-}
-
-function cancelAllActiveTimers() {
-  for (const [key, val] of crashTimers.entries()) {
-    clearInterval(val.interval);
-    clearTimeout(val.timeout);
-    crashTimers.delete(key);
-  }
-}
-
-async function startLowInstancesCountdown({
-  redis,
-  client,
-  userChannel,
-  userData,
-  discordId,
-  group,
-  isRival
-}) {
-  const timerKey = `low_inst:${discordId}`;
-  if (crashTimers.has(timerKey)) return;
-
-  if (await isFarmModeActive(redis)) return;
-
-  const sharingUsers = await getActiveSharingUsers(redis);
-  if (sharingUsers[String(discordId)]) return;
-
-  let elapsed = 0;
-  const state = await getPersonalState(redis, discordId);
-
-  const warnEmbed = new EmbedBuilder()
-    .setColor(0xffa502)
-    .setTitle("⚠️ LOW ACTIVE INSTANCES WARNING")
-    .setDescription(
-      `Hey <@${discordId}>, your bot is reporting **fewer than ${REQUIRED_ACTIVE_INSTANCES} active numeric instances**.\n\n` +
-      `📌 **Minimum Requirement:** \`${REQUIRED_ACTIVE_INSTANCES} active instances\` (applies to all groups & Rivals).\n` +
-      `⏳ **Time to fix:** \`45 minutes\` before being automatically set **OFFLINE**.`
-    )
-    .setTimestamp();
-
-  const firstWarn = await userChannel.send({
-    content: `<@${discordId}>`,
-    embeds: [warnEmbed]
-  }).catch(() => null);
-
-  if (firstWarn) {
-    state.warningMsgIds = state.warningMsgIds || [];
-    state.warningMsgIds.push(firstWarn.id);
-    await savePersonalState(redis, discordId, state);
-  }
-
-  const interval = setInterval(async () => {
-    try {
-      const currentSharing = await getActiveSharingUsers(redis);
-      if ((await isFarmModeActive(redis)) || currentSharing[String(discordId)]) {
-        cancelLowInstanceTimer(discordId);
-        return;
-      }
-
-      const onlineIds = await loadOnlineIDs(redis, group);
-      const rivalSession = isRival ? await findRivalSessionByDiscordId(redis, discordId) : null;
-      const stillOnline = isRival ? Boolean(rivalSession) : isUserOnlineInGroup(userData, onlineIds);
-
-      if (!stillOnline) {
-        cancelLowInstanceTimer(discordId);
-        return;
-      }
-
-      const activeNow = getCurrentActiveInstancesForUser(discordId);
-      if (activeNow >= REQUIRED_ACTIVE_INSTANCES) {
-        cancelLowInstanceTimer(discordId);
-        const curState = await getPersonalState(redis, discordId);
-        await clearTransientMessagesOnOnline(userChannel, curState);
-        await savePersonalState(redis, discordId, curState);
-        return;
-      }
-
-      elapsed += LOW_INSTANCES_WARNING_INTERVAL_MS;
-      const remaining = Math.max(0, Math.ceil((LOW_INSTANCES_TIMEOUT_MS - elapsed) / 60000));
-      if (remaining <= 0) return;
-
-      const remEmbed = new EmbedBuilder()
-        .setColor(0xffa502)
-        .setDescription(
-          `⏳ <@${discordId}> you are still below the minimum requirement (**${activeNow}/${REQUIRED_ACTIVE_INSTANCES} active instances**).\n` +
-          `You will be set **OFFLINE** in **${remaining} minutes** if your instances are not recovered.`
-        );
-
-      const warnMsg = await userChannel.send({
-        content: `<@${discordId}>`,
-        embeds: [remEmbed]
-      }).catch(() => null);
-
-      if (warnMsg) {
-        const curState = await getPersonalState(redis, discordId);
-        curState.warningMsgIds = curState.warningMsgIds || [];
-        curState.warningMsgIds.push(warnMsg.id);
-        await savePersonalState(redis, discordId, curState);
-      }
-    } catch (e) {
-      console.error("Error in low instance interval:", e);
-    }
-  }, LOW_INSTANCES_WARNING_INTERVAL_MS);
-
-  const timeout = setTimeout(async () => {
-    try {
-      clearInterval(interval);
-      crashTimers.delete(timerKey);
-
-      const currentSharing = await getActiveSharingUsers(redis);
-      if ((await isFarmModeActive(redis)) || currentSharing[String(discordId)]) return;
-
-      const activeNow = getCurrentActiveInstancesForUser(discordId);
-      if (activeNow >= REQUIRED_ACTIVE_INSTANCES) return;
-
-      if (isRival) {
-        await removeUserFromRivalsSession(redis, client, discordId);
-      } else {
-        await removeOnlineIDs(redis, group, getUserGameIds(userData));
-      }
-
-      const curState = await getPersonalState(redis, discordId);
-      if (Array.isArray(curState.warningMsgIds)) {
-        for (const wId of curState.warningMsgIds) {
-          const m = await userChannel.messages.fetch(wId).catch(() => null);
-          if (m) await m.delete().catch(() => {});
-        }
-        curState.warningMsgIds = [];
-      }
-
-      const kickEmbed = new EmbedBuilder()
-        .setColor(0xff4757)
-        .setTitle("🚨 AUTOMATICALLY SET OFFLINE")
-        .setDescription(
-          `<@${discordId}> you have been set **OFFLINE** in **${group.replace("_", " ")}**.\n\n` +
-          `**Reason:** Fewer than **${REQUIRED_ACTIVE_INSTANCES} active instances** for 45 consecutive minutes.`
-        )
-        .setFooter({ text: "This message will be automatically removed once you go Online and send a Heartbeat." })
-        .setTimestamp();
-
-      const kickMsg = await userChannel.send({
-        content: `<@${discordId}>`,
-        embeds: [kickEmbed]
-      }).catch(() => null);
-
-      if (kickMsg) curState.kickReasonMsgId = kickMsg.id;
-      curState.wasOnline = false;
-      await sendLastOfflineCard(userChannel, curState, userData, group.replace("_", " "));
-      await savePersonalState(redis, discordId, curState);
-    } catch (e) {
-      console.error("Error in low instance timeout:", e);
-    }
-  }, LOW_INSTANCES_TIMEOUT_MS);
-
-  crashTimers.set(timerKey, { interval, timeout });
-}
-
 // ================= EXPORTED MODULE =================
 
 module.exports = (client, options) => {
   const {
     GROUP_CONFIG,
     CHAMPION_ROLE_ID,
+    LEGEND_ROLE_ID,
     redis,
     onFarmModeChanged
   } = options;
 
   client.once("ready", () => {
-    console.log("✅ alerts.js 2.3 loaded (Toggleable Double Reroll Detector + Farm Mode)");
+    console.log("✅ alerts.js 3.0 loaded (Headless Mode • No Instances/Duos • Accounts & Proxies Sharing)");
     setInterval(scanOnlineStatusAndTimeouts, 3 * 60 * 1000);
   });
 
@@ -849,9 +544,6 @@ module.exports = (client, options) => {
       if (!guild) return;
 
       const allStatesRaw = await redis.hgetall(PERSONAL_STATE_KEY).catch(() => ({}));
-      const rivalsSessions = await getAllRivalsSessions(redis);
-      const rivalsUsers = await loadUsers(redis, "Rivals");
-
       const currentlyOnlineUsers = new Map();
 
       for (const group of Object.keys(GROUP_CONFIG)) {
@@ -861,25 +553,9 @@ module.exports = (client, options) => {
           if (isUserOnlineInGroup(uData, onlineIds)) {
             currentlyOnlineUsers.set(String(discordId), {
               userData: uData,
-              group,
-              isRival: false
+              group
             });
           }
-        }
-      }
-
-      for (const sess of rivalsSessions) {
-        for (const m of sess.members) {
-          const uData = rivalsUsers[m.discordId] || {
-            name: m.name,
-            heartbeatName: m.heartbeatName || m.name,
-            main_id: m.gameId
-          };
-          currentlyOnlineUsers.set(String(m.discordId), {
-            userData: uData,
-            group: sess.targetGroup,
-            isRival: true
-          });
         }
       }
 
@@ -890,7 +566,6 @@ module.exports = (client, options) => {
           if (!state || !state.wasOnline) continue;
 
           if (!currentlyOnlineUsers.has(String(discordId))) {
-            cancelLowInstanceTimer(discordId);
             state.wasOnline = false;
             const ch = state.channelId
               ? guild.channels.cache.get(state.channelId) || (await guild.channels.fetch(state.channelId).catch(() => null))
@@ -905,12 +580,14 @@ module.exports = (client, options) => {
         }
       }
 
-      // 2. Timeout de 40 min sin heartbeat (respetando período de gracia y usuarios en Account Sharing)
+      // 2. Timeout de 40 min sin heartbeat (respetando usuarios en Sharing Accounts o Legend Sharing Proxies)
       if (!farmMode) {
         for (const [discordId, info] of currentlyOnlineUsers.entries()) {
-          // Si está compartiendo cuentas en el GP Farm Host (🟢), no expulsar por silencio de heartbeat
-          if (sharingUsers[String(discordId)]) {
-            cancelLowInstanceTimer(discordId);
+          const member =
+            guild.members.cache.get(String(discordId)) ||
+            (await guild.members.fetch(String(discordId)).catch(() => null));
+
+          if (sharingUsers[String(discordId)] || hasLegendRole(member, LEGEND_ROLE_ID)) {
             continue;
           }
 
@@ -930,14 +607,8 @@ module.exports = (client, options) => {
           }
 
           if (now - state.lastHeartbeatAt >= HEARTBEAT_SILENCE_TIMEOUT_MS) {
-            if (info.isRival) {
-              await removeUserFromRivalsSession(redis, client, discordId);
-            } else {
-              await removeOnlineIDs(redis, info.group, getUserGameIds(info.userData));
-            }
+            await removeOnlineIDs(redis, info.group, getUserGameIds(info.userData));
 
-            cancelLowInstanceTimer(discordId);
-            const member = await guild.members.fetch(discordId).catch(() => null);
             const ch = await getOrCreatePersonalChannel({
               guild,
               member,
@@ -980,7 +651,6 @@ module.exports = (client, options) => {
       const rawText = getMessageText(message);
 
       // --- A. DETECTOR DE "Possible double reroll" ---
-      // 🛑 Solo se ejecutará si la variable ENABLE_DOUBLE_REROLL_ALERTS es verdadera
       if (ENABLE_DOUBLE_REROLL_ALERTS && rawText && /possible\s+double\s+reroll/i.test(rawText)) {
         const lines = rawText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
         const firstLine = lines[0] || rawText;
@@ -1048,14 +718,13 @@ module.exports = (client, options) => {
             const active = await isFarmModeActive(redis);
             return message.reply(
               active
-                ? "🌾 **Farm Mode is currently ACTIVE.** No users will be kicked for low instances or heartbeat timeouts."
-                : "🛡️ **Farm Mode is currently OFF.** Standard 2-instance minimum & 40m timeout rules are active."
+                ? "🌾 **Farm Mode is currently ACTIVE.** No users will be kicked for heartbeat timeouts."
+                : "🛡️ **Farm Mode is currently OFF.** Standard 40m heartbeat timeout rule is active."
             );
           }
 
           const enable = lower === "!farm on";
           await setFarmMode(redis, enable);
-          if (enable) cancelAllActiveTimers();
           if (typeof onFarmModeChanged === "function") onFarmModeChanged().catch(() => {});
 
           const embed = new EmbedBuilder()
@@ -1063,8 +732,8 @@ module.exports = (client, options) => {
             .setTitle(enable ? "🌾 FARM MODE ENABLED" : "🛡️ FARM MODE DISABLED")
             .setDescription(
               enable
-                ? "All low-instance warnings and inactivity kick timers are now **paused**. Members can farm freely without being set offline."
-                : "Automatic supervision has been restored (minimum **2 active instances** required per user)."
+                ? "Inactivity kick timers are now **paused**. Members can farm freely without being set offline."
+                : "Automatic heartbeat supervision has been restored."
             )
             .setTimestamp();
 
@@ -1087,7 +756,6 @@ module.exports = (client, options) => {
       const groupUsers = await loadUsers(redis, group);
       let matchedDiscordId = null;
       let matchedUserData = null;
-      let isRival = false;
 
       for (const [uid, uData] of Object.entries(groupUsers)) {
         const candidates = [
@@ -1101,25 +769,6 @@ module.exports = (client, options) => {
           matchedDiscordId = uid;
           matchedUserData = uData;
           break;
-        }
-      }
-
-      if (!matchedDiscordId) {
-        const rivalsUsers = await loadUsers(redis, "Rivals");
-        for (const [uid, uData] of Object.entries(rivalsUsers)) {
-          const candidates = [
-            uData.name,
-            uData.heartbeatName,
-            uData.username,
-            ...(Array.isArray(uData.aliases) ? uData.aliases : [])
-          ].filter(Boolean);
-
-          if (candidates.some((c) => namesMatchMultiPC(rawHbName, c))) {
-            matchedDiscordId = uid;
-            matchedUserData = uData;
-            isRival = true;
-            break;
-          }
         }
       }
 
@@ -1149,9 +798,7 @@ module.exports = (client, options) => {
       state.lastOnlineGroup = group;
 
       const onlineIds = await loadOnlineIDs(redis, group);
-      const rivalSession = await findRivalSessionByDiscordId(redis, matchedDiscordId);
-      const isCurrentlyOnline = Boolean(rivalSession) || isUserOnlineInGroup(matchedUserData, onlineIds);
-      if (rivalSession) isRival = true;
+      const isCurrentlyOnline = isUserOnlineInGroup(matchedUserData, onlineIds);
 
       if (isCurrentlyOnline) {
         if (!state.wasOnline) {
@@ -1160,6 +807,11 @@ module.exports = (client, options) => {
         state.wasOnline = true;
         await clearTransientMessagesOnOnline(userChannel, state);
       }
+
+      const sharingUsers = await getActiveSharingUsers(redis);
+      const isLegendProxy = hasLegendRole(member, LEGEND_ROLE_ID);
+      const isAccountSharing = Boolean(sharingUsers[String(matchedDiscordId)]?.type === "accounts");
+      const shareMode = isLegendProxy ? "proxies" : isAccountSharing ? "accounts" : null;
 
       const merged = updateAndMergeUserMultiPC(
         matchedDiscordId,
@@ -1172,8 +824,8 @@ module.exports = (client, options) => {
         userData: matchedUserData,
         groupLabel: GROUP_CONFIG[group]?.label || group,
         merged,
-        isRival,
-        farmMode
+        farmMode,
+        shareMode
       });
 
       let hbMsg = null;
@@ -1200,30 +852,6 @@ module.exports = (client, options) => {
       }
 
       await savePersonalState(redis, matchedDiscordId, state);
-
-      const sharingUsers = await getActiveSharingUsers(redis);
-      const isSharing = Boolean(sharingUsers[String(matchedDiscordId)]);
-
-      const timeSinceOnline = Date.now() - (state.onlineSince || Date.now());
-      if (isCurrentlyOnline && !farmMode && !isSharing && timeSinceOnline >= ONLINE_GRACE_PERIOD_MS) {
-        if (merged.activeCount < REQUIRED_ACTIVE_INSTANCES) {
-          await startLowInstancesCountdown({
-            redis,
-            client,
-            userChannel,
-            userData: matchedUserData,
-            discordId: matchedDiscordId,
-            group: rivalSession ? rivalSession.targetGroup : group,
-            isRival
-          });
-        } else {
-          if (cancelLowInstanceTimer(matchedDiscordId)) {
-            const updatedState = await getPersonalState(redis, matchedDiscordId);
-            await clearTransientMessagesOnOnline(userChannel, updatedState);
-            await savePersonalState(redis, matchedDiscordId, updatedState);
-          }
-        }
-      }
     } catch (err) {
       console.error("🔥 Error in alerts.js:", err);
     }
