@@ -444,6 +444,292 @@ async function scanFarmHostSharingPanel() {
         };
         if (!current.hosts.includes(entry.hostName)) {
           current.hosts.push(entry.hostName);
+        }// ================= FUZZY NAME MATCHING & IMPROVED GP FARM HOST SCANNER =================
+
+function cleanNameForComparison(str) {
+  return String(str || "")
+    .normalize("NFKC")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/[*_`~|>@#]/g, "")
+    .replace(/\s+/g, "")
+    .trim()
+    .toLowerCase();
+}
+
+function simplifyRootName(str) {
+  const cleaned = cleanNameForComparison(str);
+  // Reduce letras repetidas (ej: "creeeder91" -> "creder91")
+  const collapsed = cleaned.replace(/(.)\1+/g, "$1");
+  // Quita números o sufijos al final (ej: "creder91" -> "creder", "creederp1" -> "creder")
+  const stripped = collapsed.replace(/(?:[p_-]?\d{1,4}|[_-]?(?:main|alt|bot|host|gp|pc\d*))$/i, "");
+  return stripped.length >= 2 ? stripped : collapsed;
+}
+
+function levenshteinDistance(a, b) {
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  const matrix = Array.from({ length: b.length + 1 }, (_, i) => [i]);
+  for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      const cost = b.charAt(i - 1) === a.charAt(j - 1) ? 0 : 1;
+      matrix[i][j] = Math.min(
+        matrix[i - 1][j] + 1,
+        matrix[i][j - 1] + 1,
+        matrix[i - 1][j - 1] + cost
+      );
+    }
+  }
+  return matrix[b.length][a.length];
+}
+
+function calculateNameSimilarity(rawA, rawB) {
+  const a = cleanNameForComparison(rawA);
+  const b = cleanNameForComparison(rawB);
+  if (!a || !b) return 0;
+  if (a === b) return 1.0;
+
+  const rootA = simplifyRootName(a);
+  const rootB = simplifyRootName(b);
+  if (rootA && rootB && rootA === rootB && rootA.length >= 2) {
+    return 0.96;
+  }
+
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length > b.length ? a : b;
+  if (shorter.length >= 2 && (longer.startsWith(shorter) || longer.includes(shorter))) {
+    const ratio = shorter.length / longer.length;
+    if (ratio >= 0.50) return 0.90;
+  }
+  if (rootA.length >= 2 && rootB.length >= 2 && (rootA.includes(rootB) || rootB.includes(rootA))) {
+    return 0.88;
+  }
+
+  const maxLen = Math.max(a.length, b.length);
+  const dist = levenshteinDistance(a, b);
+  const scoreFull = 1 - dist / maxLen;
+
+  const maxRootLen = Math.max(rootA.length, rootB.length);
+  const distRoot = levenshteinDistance(rootA, rootB);
+  const scoreRoot = maxRootLen > 0 ? 1 - distRoot / maxRootLen : 0;
+
+  return Math.max(scoreFull, scoreRoot);
+}
+
+function parseFarmHostPanelMessage(msg) {
+  const entries = [];
+  const blocks = [];
+
+  if (msg.content) {
+    blocks.push({ title: "GP Farm Host", text: msg.content });
+  }
+  if (Array.isArray(msg.embeds)) {
+    for (const emb of msg.embeds) {
+      const title = emb.title || emb.author?.name || "";
+      const desc = emb.description || "";
+      const fieldsText = Array.isArray(emb.fields)
+        ? emb.fields.map((f) => `${f.name}\n${f.value}`).join("\n")
+        : "";
+      const footerText = emb.footer?.text || "";
+      blocks.push({ title, text: `${title}\n${desc}\n${fieldsText}\n${footerText}` });
+    }
+  }
+
+  for (const block of blocks) {
+    if (!/gp\s*farm\s*host|monitor\s*link|shared\s*accounts|own\s*accounts/i.test(block.text)) continue;
+
+    let hostName = "Farm Host";
+    const hostMatch =
+      block.title.match(/([a-zA-Z0-9_-]+)\s*[—–\-]+\s*GP\s*farm\s*host/i) ||
+      block.text.match(/([a-zA-Z0-9_-]+)\s*[—–\-]+\s*GP\s*farm\s*host/i);
+    if (hostMatch) hostName = hostMatch[1].trim();
+
+    const lines = block.text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    for (const line of lines) {
+      // Ignorar la línea de leyenda del footer ("ready/total • 🟢 Monitor Link on • 🔴 off")
+      if (/monitor\s*link\s*on/i.test(line) || /ready\s*=\s*can\s*open/i.test(line)) continue;
+
+      // Detectar círculo verde al inicio (incluso si tiene espacios, negritas o formato de lista)
+      const isGreen =
+        /^[\s>*\-•]*(?:🟢|🟩|:green_circle:|<a?:[a-z0-9_]*green[a-z0-9_]*:\d+>)/i.test(line);
+
+      if (!isGreen) continue;
+
+      const rest = line
+        .replace(/^[\s>*\-•]*(?:🟢|🟩|:green_circle:|<a?:[a-z0-9_]+:\d+>)[\s*]*/i, "")
+        .trim();
+
+      // 1. Extraer mención directa <@ID> si existe
+      let mentionedDiscordId = null;
+      const mentionMatch = rest.match(/<@!?(\d{17,20})>/);
+      if (mentionMatch) {
+        mentionedDiscordId = mentionMatch[1];
+      }
+
+      // 2. Extraer el nombre antes del separador "— 905/1285"
+      const parts = rest.split(/\s*(?:[—–\-]+)\s*(?=\**\d+\s*\/)/);
+      const rawUserPart = (parts[0] || rest.split(/\s+[—–\-]\s+/)[0] || "")
+        .replace(/<@!?\d{17,20}>/g, "")
+        .replace(/[*_`~]/g, "")
+        .replace(/^@+/, "")
+        .trim();
+
+      let ready = 0;
+      let total = 0;
+      const countMatch = rest.replace(/\*/g, "").match(/(\d+)\s*\/\s*(\d+)/);
+      if (countMatch) {
+        ready = Number(countMatch[1]) || 0;
+        total = Number(countMatch[2]) || 0;
+      }
+
+      entries.push({
+        hostName,
+        mentionedDiscordId,
+        rawName: rawUserPart,
+        ready,
+        total
+      });
+    }
+  }
+
+  return entries;
+}
+
+async function scanFarmHostSharingPanel() {
+  try {
+    const candidateChannels = new Map();
+
+    // 1. Si FARM_HOST_CHANNEL_ID está configurado, revisarlo primero
+    if (FARM_HOST_CHANNEL_ID) {
+      const ch = await client.channels.fetch(FARM_HOST_CHANNEL_ID).catch(() => null);
+      if (ch && ch.isTextBased()) candidateChannels.set(ch.id, ch);
+    }
+
+    // 2. Escanear todos los canales de texto visibles del servidor para encontrar el panel sin importar cómo se llame el canal
+    const guild = client.guilds.cache.first();
+    if (guild) {
+      await guild.members.fetch().catch(() => {});
+      for (const ch of guild.channels.cache.values()) {
+        if (ch.isTextBased() && !ch.name.startsWith("personal-")) {
+          candidateChannels.set(ch.id, ch);
+        }
+      }
+    }
+
+    const latestHostEntries = new Map();
+
+    for (const ch of candidateChannels.values()) {
+      const msgs = await ch.messages.fetch({ limit: 25 }).catch(() => null);
+      if (!msgs) continue;
+
+      const sortedMsgs = Array.from(msgs.values()).sort((a, b) => b.createdTimestamp - a.createdTimestamp);
+      for (const msg of sortedMsgs) {
+        const parsed = parseFarmHostPanelMessage(msg);
+        if (parsed.length > 0) {
+          for (const item of parsed) {
+            const hKey = item.hostName.toLowerCase();
+            if (!latestHostEntries.has(hKey)) {
+              latestHostEntries.set(hKey, { msgId: msg.id, ts: msg.createdTimestamp, list: [] });
+            }
+            if (latestHostEntries.get(hKey).msgId === msg.id) {
+              latestHostEntries.get(hKey).list.push(item);
+            }
+          }
+        }
+      }
+    }
+
+    const greenEntries = [];
+    for (const hostGroup of latestHostEntries.values()) {
+      greenEntries.push(...hostGroup.list);
+    }
+
+    // 3. Cargar TODOS los registros de Redis (incluyendo Rivals y Trainer antiguos por si se registraron ahí)
+    const allRegisteredUsers = new Map();
+    const allPossibleRedisGroups = ["Elite_Four", "Gym_Leader", "Rivals", "Trainer"];
+
+    for (const grp of allPossibleRedisGroups) {
+      const gUsers = await getUsers(grp);
+      for (const [uid, uData] of Object.entries(gUsers)) {
+        const existing = allRegisteredUsers.get(String(uid)) || {};
+        const member = guild?.members?.cache?.get(String(uid));
+        const extraAliases = member
+          ? [member.displayName, member.user.username, member.user.globalName].filter(Boolean)
+          : [];
+        allRegisteredUsers.set(String(uid), {
+          ...uData,
+          ...existing,
+          aliases: [
+            ...(Array.isArray(uData.aliases) ? uData.aliases : []),
+            ...(Array.isArray(existing.aliases) ? existing.aliases : []),
+            ...extraAliases
+          ]
+        });
+      }
+    }
+
+    const newSharingMap = new Map();
+
+    for (const entry of greenEntries) {
+      let matchedDiscordId = null;
+      const searchNames = [];
+
+      if (entry.rawName) searchNames.push(entry.rawName);
+
+      // A. Si la línea tiene mención <@ID>, resolvemos el miembro en Discord y sacamos todos sus nombres
+      if (entry.mentionedDiscordId) {
+        if (allRegisteredUsers.has(String(entry.mentionedDiscordId))) {
+          matchedDiscordId = String(entry.mentionedDiscordId);
+        } else if (guild) {
+          const mentionedMember =
+            guild.members.cache.get(String(entry.mentionedDiscordId)) ||
+            (await guild.members.fetch(String(entry.mentionedDiscordId)).catch(() => null));
+          if (mentionedMember) {
+            searchNames.push(
+              mentionedMember.displayName,
+              mentionedMember.user.username,
+              mentionedMember.user.globalName
+            );
+          }
+        }
+      }
+
+      // B. Si aún no hizo match por ID directo, comparar todos los nombres contra los registros de Redis y miembros del servidor
+      if (!matchedDiscordId) {
+        let bestUid = null;
+        let bestScore = 0;
+
+        for (const sName of searchNames.filter(Boolean)) {
+          for (const [uid, uData] of allRegisteredUsers.entries()) {
+            const candidates = getUserNameCandidates(uData);
+            for (const cand of candidates) {
+              const score = calculateNameSimilarity(sName, cand);
+              if (score >= 0.72 && score > bestScore) {
+                bestScore = score;
+                bestUid = String(uid);
+              }
+            }
+          }
+        }
+
+        if (bestUid) {
+          matchedDiscordId = bestUid;
+        } else if (entry.mentionedDiscordId) {
+          // Si era una mención válida de Discord aunque esté en otro registro, guardamos su Discord ID directamente
+          matchedDiscordId = String(entry.mentionedDiscordId);
+        }
+      }
+
+      if (matchedDiscordId) {
+        const current = newSharingMap.get(matchedDiscordId) || {
+          type: "accounts",
+          hosts: [],
+          ready: 0,
+          total: 0
+        };
+        if (!current.hosts.includes(entry.hostName)) {
+          current.hosts.push(entry.hostName);
         }
         current.ready += entry.ready;
         current.total += entry.total;
@@ -451,7 +737,7 @@ async function scanFarmHostSharingPanel() {
       }
     }
 
-    // 3. Incluir también usuarios con rol Legend como "proxies" en el mapa de protección
+    // 4. Incluir también usuarios con rol Legend como "proxies"
     if (guild) {
       for (const [uid] of allRegisteredUsers.entries()) {
         const member = guild.members.cache.get(String(uid));
@@ -474,11 +760,17 @@ async function scanFarmHostSharingPanel() {
     }
 
     await redis.set(SHARING_USERS_KEY, JSON.stringify(redisPayload)).catch(() => {});
-    console.log(`🔄 [Host & Proxy Scanner] Active sharing users detected: ${activeSharingUsersMap.size}`);
+    console.log(
+      `🔄 [Host & Proxy Scanner] Green lines parsed: ${greenEntries.length} | Matched users: ${activeSharingUsersMap.size}`,
+      Array.from(activeSharingUsersMap.keys())
+    );
   } catch (err) {
     console.error("❌ Error scanning GP Farm Host panel:", err);
   }
 }
+
+//////AQUIIIIIIIIIIIIIIIIIIIII
+
 
 // ================= FETCH MESSAGES & HEARTBEAT PARSERS =================
 
@@ -1040,12 +1332,12 @@ client.once("ready", async () => {
   client.statsPanelMessages = new Map();
   client.lastTotalPPMByGroup = new Map();
 
-  await scanFarmHostSharingPanel();
+  await ();
   await updateAllPanels();
   await storeAllPPM();
 
   setInterval(async () => {
-    await scanFarmHostSharingPanel();
+    await ();
     await updateAllPanels();
   }, SCAN_SHARING_INTERVAL);
 
