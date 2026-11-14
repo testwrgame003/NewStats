@@ -9,7 +9,8 @@
   "dependencies": {
     "@upstash/redis": "^1.34.0",
     "canvas": "^2.11.2",
-    "discord.js": "^14.16.2"
+    "discord.js": "^14.16.2",
+    "tesseract.js": "^5.1.1"
   },
   "engines": {
     "node": ">=18.0.0"
