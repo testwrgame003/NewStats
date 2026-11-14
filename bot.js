@@ -5,6 +5,14 @@ const {
 } = require("discord.js");
 const { Redis } = require("@upstash/redis");
 
+// Motor OCR para leer los nombres directamente de la imagen del Host (farm-4.jpg)
+let Tesseract = null;
+try {
+  Tesseract = require("tesseract.js");
+} catch {
+  console.warn("⚠️ 'tesseract.js' no está instalado. Agrégalo a tu package.json o ejecuta 'npm install tesseract.js'.");
+}
+
 const TOKEN = process.env.LATIOS_TOKEN || process.env.DISCORD_TOKEN || process.env.TOKEN;
 
 if (!TOKEN) {
@@ -20,12 +28,12 @@ const redis = new Redis({
 // ================= GLOBAL CONFIGURATION =================
 
 const CHAMPION_ROLE_ID = "1486206362332434634";
-const LEGEND_ROLE_ID = "1564892157922254889"; // Opcional: también detecta automáticamente por nombre de rol "Legend"
+const LEGEND_ROLE_ID = "1564892157922254889";
 const PUBLIC_ALERTS_CHANNEL_ID = "1488766924321198080";
 const GLOBAL_HEARTBEAT_CHANNEL_ID = "1492795826857054301";
 const PERSONAL_CATEGORY_ID = "1565623831203287150";
 
-// Si tienes el ID exacto del canal del panel GP Farm Host puedes ponerlo en Railway como FARM_HOST_CHANNEL_ID
+// ID del canal donde se publica la imagen del Host (farm-4.jpg)
 const FARM_HOST_CHANNEL_ID = process.env.FARM_HOST_CHANNEL_ID || PUBLIC_ALERTS_CHANNEL_ID;
 
 const FARM_MODE_KEY = "system:farm_mode";
@@ -53,9 +61,11 @@ const SCAN_SHARING_INTERVAL = 20 * 60 * 1000;
 const MASSIVE_PPM_THRESHOLD = 15.0;
 const MASSIVE_ALERT_COOLDOWN = 2 * 60 * 60 * 1000;
 const HEARTBEAT_TIMEOUT_MS = 30 * 60 * 1000;
+const ZEKROM_HOST_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutos máximo para considerar activo a Zekrom-Host
 
 const massivePpmCooldowns = new Map();
 const activeSharingUsersMap = new Map();
+const ocrImageCache = new Map();
 
 const client = new Client({
   intents: [
@@ -185,7 +195,7 @@ function hasLegendRole(member) {
   return member.roles.cache.some((r) => r.name.trim().toLowerCase() === "legend");
 }
 
-// ================= FUZZY NAME MATCHING & IMPROVED GP FARM HOST SCANNER =================
+// ================= FUZZY NAME MATCHING & OCR IMAGE HOST SCANNER =================
 
 function cleanNameForComparison(str) {
   return String(str || "")
@@ -199,9 +209,7 @@ function cleanNameForComparison(str) {
 
 function simplifyRootName(str) {
   const cleaned = cleanNameForComparison(str);
-  // Reduce letras repetidas (ej: "creeeder91" -> "creder91")
   const collapsed = cleaned.replace(/(.)\1+/g, "$1");
-  // Quita números o sufijos al final (ej: "creder91" -> "creder", "creederp1" -> "creder")
   const stripped = collapsed.replace(/(?:[p_-]?\d{1,4}|[_-]?(?:main|alt|bot|host|gp|pc\d*))$/i, "");
   return stripped.length >= 2 ? stripped : collapsed;
 }
@@ -258,6 +266,142 @@ function calculateNameSimilarity(rawA, rawB) {
   return Math.max(scoreFull, scoreRoot);
 }
 
+function extractImageUrlsFromMessage(msg) {
+  if (!msg) return [];
+  const urls = [];
+
+  if (msg.attachments?.size > 0) {
+    for (const att of msg.attachments.values()) {
+      const ct = (att.contentType || "").toLowerCase();
+      const fn = (att.name || "").toLowerCase();
+      if (ct.startsWith("image/") || /\.(png|jpe?g|webp)$/i.test(fn)) {
+        urls.push(att.url);
+      }
+    }
+  }
+
+  if (Array.isArray(msg.embeds)) {
+    for (const emb of msg.embeds) {
+      if (emb.image?.url) urls.push(emb.image.url);
+      if (emb.thumbnail?.url) urls.push(emb.thumbnail.url);
+    }
+  }
+
+  return urls;
+}
+
+function parseOcrTextFromFarmImage(ocrText) {
+  if (!ocrText) return [];
+  const text = String(ocrText);
+
+  if (!/god\s*pack\s*farm|members\s*online|dual\s*fusion|own\s*accounts|opened\s*\/\s*total|left\s*now/i.test(text)) {
+    return [];
+  }
+
+  let hostName = "Farm Host";
+  const hostMatch = text.match(/Host\s+([a-zA-Z0-9_-]+)/i);
+  if (hostMatch) hostName = hostMatch[1].trim();
+
+  const entries = [];
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+  const ignoreWords = new Set([
+    "membersonline",
+    "members",
+    "online",
+    "opened",
+    "total",
+    "left",
+    "leftnow",
+    "accounts",
+    "godpackfarm",
+    "dualfusion",
+    "megamewtwox",
+    "host",
+    "pocket",
+    "pokemon",
+    "tradingcardgame"
+  ]);
+
+  let insideTable = false;
+
+  for (const line of lines) {
+    if (/members\s*online/i.test(line)) {
+      insideTable = true;
+      continue;
+    }
+    if (/^total\b/i.test(line)) {
+      break;
+    }
+
+    const rowMatch = line.match(/^\s*(\d{1,2})\s+([^\d\s|—–\-]+(?:\s+[^\d\s|—–\-]+)?)/);
+    if (rowMatch) {
+      const rankNum = Number(rowMatch[1]);
+      const rawCandidate = rowMatch[2].replace(/[|—–\-_]+$/g, "").trim();
+      const cleanCand = cleanNameForComparison(rawCandidate);
+
+      if (rankNum >= 1 && rankNum <= 50 && cleanCand.length >= 2 && !ignoreWords.has(cleanCand)) {
+        entries.push({
+          hostName,
+          mentionedDiscordId: null,
+          rawName: rawCandidate,
+          ready: 0,
+          total: 0
+        });
+        continue;
+      }
+    }
+
+    if (insideTable) {
+      const tokens = line.split(/\s+/);
+      const firstWord = tokens[0]?.replace(/^\d+/, "").trim();
+      const cleanFirst = cleanNameForComparison(firstWord);
+      const hasNumbersAtEnd = /\d+\s*$/.test(line);
+
+      if (
+        firstWord &&
+        cleanFirst.length >= 2 &&
+        !ignoreWords.has(cleanFirst) &&
+        !/^\d+$/.test(cleanFirst) &&
+        hasNumbersAtEnd
+      ) {
+        entries.push({
+          hostName,
+          mentionedDiscordId: null,
+          rawName: firstWord,
+          ready: 0,
+          total: 0
+        });
+      }
+    }
+  }
+
+  return entries;
+}
+
+async function extractEntriesFromFarmImage(imageUrl) {
+  if (!Tesseract || !imageUrl) return [];
+
+  if (ocrImageCache.has(imageUrl)) {
+    return ocrImageCache.get(imageUrl);
+  }
+
+  try {
+    const { data } = await Tesseract.recognize(imageUrl, "eng");
+    const parsed = parseOcrTextFromFarmImage(data?.text || "");
+
+    if (ocrImageCache.size > 40) {
+      const oldestKey = ocrImageCache.keys().next().value;
+      ocrImageCache.delete(oldestKey);
+    }
+    ocrImageCache.set(imageUrl, parsed);
+    return parsed;
+  } catch (err) {
+    console.error("❌ Error ejecutando OCR en imagen del Host:", err.message);
+    return [];
+  }
+}
+
 function parseFarmHostPanelMessage(msg) {
   if (!msg) return [];
   const entries = [];
@@ -279,20 +423,19 @@ function parseFarmHostPanelMessage(msg) {
   }
 
   for (const block of blocks) {
-    if (!/gp\s*farm\s*host|monitor\s*link|shared\s*accounts|own\s*accounts/i.test(block.text)) continue;
+    if (!/gp\s*farm\s*host|monitor\s*link|shared\s*accounts|own\s*accounts|members\s*online/i.test(block.text)) continue;
 
     let hostName = "Farm Host";
     const hostMatch =
       block.title.match(/([a-zA-Z0-9_-]+)\s*[—–\-]+\s*GP\s*farm\s*host/i) ||
-      block.text.match(/([a-zA-Z0-9_-]+)\s*[—–\-]+\s*GP\s*farm\s*host/i);
+      block.text.match(/([a-zA-Z0-9_-]+)\s*[—–\-]+\s*GP\s*farm\s*host/i) ||
+      block.text.match(/Host\s+([a-zA-Z0-9_-]+)/i);
     if (hostMatch) hostName = hostMatch[1].trim();
 
     const lines = block.text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
     for (const line of lines) {
-      // Ignorar la línea de leyenda del footer ("ready/total • 🟢 Monitor Link on • 🔴 off")
       if (/monitor\s*link\s*on/i.test(line) || /ready\s*=\s*can\s*open/i.test(line)) continue;
 
-      // Detectar círculo verde al inicio (incluso si tiene espacios, negritas o formato de lista)
       const isGreen =
         /^[\s>*\-•]*(?:🟢|🟩|:green_circle:|<a?:[a-z0-9_]*green[a-z0-9_]*:\d+>)/i.test(line);
 
@@ -302,14 +445,12 @@ function parseFarmHostPanelMessage(msg) {
         .replace(/^[\s>*\-•]*(?:🟢|🟩|:green_circle:|<a?:[a-z0-9_]+:\d+>)[\s*]*/i, "")
         .trim();
 
-      // 1. Extraer mención directa <@ID> si existe
       let mentionedDiscordId = null;
       const mentionMatch = rest.match(/<@!?(\d{17,20})>/);
       if (mentionMatch) {
         mentionedDiscordId = mentionMatch[1];
       }
 
-      // 2. Extraer el nombre antes del separador "— 905/1285"
       const parts = rest.split(/\s*(?:[—–\-]+)\s*(?=\**\d+\s*\/)/);
       const rawUserPart = (parts[0] || rest.split(/\s+[—–\-]\s+/)[0] || "")
         .replace(/<@!?\d{17,20}>/g, "")
@@ -342,18 +483,20 @@ async function scanFarmHostSharingPanel() {
   try {
     const candidateChannels = new Map();
 
-    // 1. Si FARM_HOST_CHANNEL_ID está configurado, revisarlo primero
     if (FARM_HOST_CHANNEL_ID) {
       const ch = await client.channels.fetch(FARM_HOST_CHANNEL_ID).catch(() => null);
       if (ch && ch.isTextBased()) candidateChannels.set(ch.id, ch);
     }
 
-    // 2. Escanear todos los canales de texto visibles del servidor para encontrar el panel
     const guild = client.guilds.cache.first();
     if (guild) {
       await guild.members.fetch().catch(() => {});
       for (const ch of guild.channels.cache.values()) {
-        if (ch.isTextBased() && !ch.name.startsWith("personal-")) {
+        if (
+          ch.isTextBased() &&
+          !ch.name.startsWith("personal-") &&
+          /farm|host|share|sharing|arcade|zekrom|monitor|status|alert/i.test(ch.name)
+        ) {
           candidateChannels.set(ch.id, ch);
         }
       }
@@ -362,12 +505,23 @@ async function scanFarmHostSharingPanel() {
     const latestHostEntries = new Map();
 
     for (const ch of candidateChannels.values()) {
-      const msgs = await ch.messages.fetch({ limit: 25 }).catch(() => null);
+      const msgs = await ch.messages.fetch({ limit: 15 }).catch(() => null);
       if (!msgs) continue;
 
       const sortedMsgs = Array.from(msgs.values()).sort((a, b) => b.createdTimestamp - a.createdTimestamp);
       for (const msg of sortedMsgs) {
-        const parsed = parseFarmHostPanelMessage(msg);
+        let parsed = parseFarmHostPanelMessage(msg);
+
+        if (parsed.length === 0) {
+          const imgUrls = extractImageUrlsFromMessage(msg);
+          for (const url of imgUrls) {
+            const ocrEntries = await extractEntriesFromFarmImage(url);
+            if (ocrEntries.length > 0) {
+              parsed.push(...ocrEntries);
+            }
+          }
+        }
+
         if (parsed.length > 0) {
           for (const item of parsed) {
             const hKey = item.hostName.toLowerCase();
@@ -380,14 +534,15 @@ async function scanFarmHostSharingPanel() {
           }
         }
       }
+
+      if (latestHostEntries.size > 0 && ch.id === FARM_HOST_CHANNEL_ID) break;
     }
 
-    const greenEntries = [];
+    const detectedEntries = [];
     for (const hostGroup of latestHostEntries.values()) {
-      greenEntries.push(...hostGroup.list);
+      detectedEntries.push(...hostGroup.list);
     }
 
-    // 3. Cargar TODOS los registros de Redis (incluyendo Rivals y Trainer antiguos por si se registraron ahí)
     const allRegisteredUsers = new Map();
     const allPossibleRedisGroups = ["Elite_Four", "Gym_Leader", "Rivals", "Trainer"];
 
@@ -413,13 +568,12 @@ async function scanFarmHostSharingPanel() {
 
     const newSharingMap = new Map();
 
-    for (const entry of greenEntries) {
+    for (const entry of detectedEntries) {
       let matchedDiscordId = null;
       const searchNames = [];
 
       if (entry.rawName) searchNames.push(entry.rawName);
 
-      // A. Si la línea tiene mención <@ID>, resolvemos el miembro en Discord y sacamos todos sus nombres
       if (entry.mentionedDiscordId) {
         if (allRegisteredUsers.has(String(entry.mentionedDiscordId))) {
           matchedDiscordId = String(entry.mentionedDiscordId);
@@ -437,7 +591,6 @@ async function scanFarmHostSharingPanel() {
         }
       }
 
-      // B. Comparar todos los nombres contra los registros de Redis y miembros del servidor
       if (!matchedDiscordId) {
         let bestUid = null;
         let bestScore = 0;
@@ -478,7 +631,6 @@ async function scanFarmHostSharingPanel() {
       }
     }
 
-    // 4. Incluir también usuarios con rol Legend como "proxies"
     if (guild) {
       for (const [uid] of allRegisteredUsers.entries()) {
         const member = guild.members.cache.get(String(uid));
@@ -502,7 +654,7 @@ async function scanFarmHostSharingPanel() {
 
     await redis.set(SHARING_USERS_KEY, JSON.stringify(redisPayload)).catch(() => {});
     console.log(
-      `🔄 [Host & Proxy Scanner] Green lines parsed: ${greenEntries.length} | Matched users: ${activeSharingUsersMap.size}`,
+      `🔄 [Host Image & Text Scanner] Entries parsed: ${detectedEntries.length} | Matched sharing users: ${activeSharingUsersMap.size}`,
       Array.from(activeSharingUsersMap.keys())
     );
   } catch (err) {
@@ -592,6 +744,31 @@ function extractHeartbeatName(content) {
   return firstLine.replace(/[:：]+$/g, "").trim();
 }
 
+/**
+ * Busca el último heartbeat de "Zekrom-Host".
+ * Si tiene más de 15 minutos de antigüedad (ZEKROM_HOST_TIMEOUT_MS), se considera OFFLINE (retorna null).
+ */
+function findZekromHostStats(messages, now) {
+  if (!messages || !Array.isArray(messages)) return null;
+
+  for (const msg of messages) {
+    const content = getMessageText(msg);
+    if (!content) continue;
+
+    const rawHbName = extractHeartbeatName(content);
+    const normHbName = normalizeHeartbeatName(rawHbName);
+
+    if (normHbName === "zekrom-host" || normHbName === "zekromhost" || normHbName === "zekrom host") {
+      // Si el último heartbeat de Zekrom-Host tiene más de 15 minutos, ya está OFFLINE
+      if (now - msg.createdTimestamp > ZEKROM_HOST_TIMEOUT_MS) {
+        return null;
+      }
+      return parseStats(content);
+    }
+  }
+  return null;
+}
+
 function namesMatchMultiPC(heartbeatName, registeredName) {
   const hb = normalizeHeartbeatName(heartbeatName);
   const reg = normalizeHeartbeatName(registeredName);
@@ -677,13 +854,18 @@ function buildPowerBar(currentPPM, maxExpectedPPM = 120) {
   return "▰".repeat(filled) + "▱".repeat(length - filled);
 }
 
-function calculateGlobalStats(onlineStats, sharingAccountsCount, sharingProxiesCount) {
+function calculateGlobalStats(onlineStats, sharingAccountsCount, sharingProxiesCount, zekromStats = null) {
   let totalPPM = 0;
   let totalPacks = 0;
 
   for (const s of onlineStats) {
     totalPPM += Number(s.ppm) || 0;
     totalPacks += Number(s.packs) || 0;
+  }
+
+  if (zekromStats) {
+    totalPPM += Number(zekromStats.ppm) || 0;
+    totalPacks += Number(zekromStats.packs) || 0;
   }
 
   const users = onlineStats.length;
@@ -777,7 +959,7 @@ async function checkAndTriggerMassiveRerollAlert(group, channel, highPpmUsers) {
   }
 }
 
-// ================= PANEL GENERATOR (HEADLESS + SHARING ACCOUNTS / PROXIES) =================
+// ================= PANEL GENERATOR (ZEKROM-HOST + SHARING ACCOUNTS / PROXIES) =================
 
 async function generatePanel(group, panelChannel) {
   const config = GROUP_CONFIG[group];
@@ -797,6 +979,9 @@ async function generatePanel(group, panelChannel) {
 
   const now = Date.now();
 
+  // Detectar si llegó un heartbeat de "Zekrom-Host" en los últimos 15 minutos
+  const zekromStats = findZekromHostStats(messages, now);
+
   let lastStopData = {};
   try {
     const rawStops = await redis.hgetall("last_stopppm");
@@ -810,13 +995,21 @@ async function generatePanel(group, panelChannel) {
 
     if (!isOnline) continue;
 
+    // Si este usuario tenía configurado "Zekrom-Host" como su heartbeatName, lo saltamos de la lista normal
+    // porque Zekrom-Host se evalúa con su regla exclusiva de 15 minutos arriba
+    const isZekromUser = getUserNameCandidates(rawUser).some((c) => {
+      const n = normalizeHeartbeatName(c);
+      return n === "zekrom-host" || n === "zekromhost" || n === "zekrom host";
+    });
+    if (isZekromUser) continue;
+
     // Verificar si el usuario tiene el rol Legend -> Sharing Proxies
     const member =
       guild?.members?.cache?.get(String(discordId)) ||
       (guild ? await guild.members.fetch(String(discordId)).catch(() => null) : null);
     const isLegendProxy = hasLegendRole(member);
 
-    // Verificar si está en el panel GP Farm Host -> Sharing Accounts
+    // Verificar si salió en la imagen del Host -> Sharing Accounts
     const hostShareInfo = activeSharingUsersMap.get(String(discordId)) || null;
     const isAccountSharing = Boolean(hostShareInfo && hostShareInfo.type === "accounts");
 
@@ -874,31 +1067,40 @@ async function generatePanel(group, panelChannel) {
     return b.stats.packs - a.stats.packs || b.stats.ppm - a.stats.ppm;
   });
 
-  const onlineLines = processedOnlineUsers.map((u) => {
+  const onlineLines = [];
+
+  // Si hay un heartbeat de Zekrom-Host de hace <= 15 minutos, mostrar Zekrom host running y su PPM
+  if (zekromStats) {
+    onlineLines.push(`⚡ **Zekrom host running** • \`${zekromStats.ppm.toFixed(2)} PPM\``);
+  }
+
+  for (const u of processedOnlineUsers) {
     if (u.shareMode === "proxies") {
-      return (
+      onlineLines.push(
         `🌐 **${u.name}** \`🟣 SHARING PROXIES\`\n` +
-        `┗ 🔗 \`Sharing Proxies Active\`  •  ⚡ \`Headless Proxy Node ON\``
+        `┗ 🔗 \`Sharing Proxies\``
       );
+      continue;
     }
 
     if (u.shareMode === "accounts") {
-      return (
+      onlineLines.push(
         `🎲 **${u.name}** \`🟢 SHARING ACCOUNTS\`\n` +
-        `┗ 🔗 \`Sharing Accounts Active\`  •  🖥️ \`GP Farm Host (Monitor Link ON)\``
+        `┗ 🔗 \`Sharing Accounts\``
       );
+      continue;
     }
 
     const multiPcTag = u.stats.pcCount > 1 ? " `🖥️ 2-Nodes`" : "";
     const turboIcon = u.stats.ppm > MASSIVE_PPM_THRESHOLD ? " 🔥" : "";
 
-    return (
+    onlineLines.push(
       `⚡ **${u.name}**${multiPcTag}${turboIcon}\n` +
       `┗ ⚡ \`${u.stats.ppm.toFixed(2)} PPM\`  •  🀄 \`${u.stats.packs.toLocaleString()} Packs\`  •  ⏱️ \`${u.stats.time}\``
     );
-  });
+  }
 
-  const global = calculateGlobalStats(onlineStats, sharingAccountsCount, sharingProxiesCount);
+  const global = calculateGlobalStats(onlineStats, sharingAccountsCount, sharingProxiesCount, zekromStats);
   const gp = formatGPStats(await getLiveStats(group));
   const cachedAvgPPM = await refreshAveragePPM(group);
   const powerBar = buildPowerBar(global.rawTotalPPM, 120);
@@ -946,7 +1148,7 @@ async function generatePanel(group, panelChannel) {
       { name: "💫 Total (5 Days)", value: `**${gp.totalGP} GP**\n💖 **${gp.totalAlive} Alive**`, inline: true },
       { name: "📅 Last 5 Days History", value: gp.historyText, inline: false }
     )
-    .setFooter({ text: "Auto-updates every 5 mins • Headless System (Accounts & Proxies Sharing)" })
+    .setFooter({ text: "Auto-updates every 5 mins • Headless System (Zekrom-Host 15m Timeout & OCR Sharing)" })
     .setTimestamp();
 
   return {
@@ -1022,8 +1224,11 @@ async function storeAllPPM() {
 
 async function handlePossibleHostPanelUpdate(msg) {
   try {
-    const parsed = parseFarmHostPanelMessage(msg);
-    if (parsed.length > 0) {
+    if (!msg) return;
+    const textParsed = parseFarmHostPanelMessage(msg);
+    const hasImages = extractImageUrlsFromMessage(msg).length > 0;
+
+    if (textParsed.length > 0 || (hasImages && msg.channel?.id === FARM_HOST_CHANNEL_ID)) {
       await scanFarmHostSharingPanel();
       await updateAllPanels();
     }
