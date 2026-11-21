@@ -9,14 +9,24 @@ const ENABLE_DOUBLE_REROLL_ALERTS = false; // 🛑 Cambia a true para REACTIVAR 
 
 const PERSONAL_CHANNELS_CATEGORY_ID = "1565623831203287150";
 const HEARTBEAT_SILENCE_TIMEOUT_MS = 40 * 60 * 1000;
-const ONLINE_GRACE_PERIOD_MS = 15 * 60 * 1000; // 15 minutos de gracia para el primer heartbeat
+const ONLINE_GRACE_PERIOD_MS = 15 * 60 * 1000;
 
 const PERSONAL_STATE_KEY = "personal_channel_state";
 const FARM_MODE_KEY = "system:farm_mode";
-const SHARING_USERS_KEY = "active_sharing_users";
 
+// Cachés en memoria para minimizar comandos a Upstash
 const USERS_CACHE = new Map();
-const USERS_CACHE_TTL = 2 * 60 * 1000;
+const USERS_CACHE_TTL = 15 * 60 * 1000; // 15 minutos
+
+const ONLINE_CACHE = new Map();
+const ONLINE_CACHE_TTL = 2 * 60 * 1000; // 2 minutos
+
+let FARM_MODE_CACHE = { ts: 0, val: false };
+const FARM_MODE_TTL = 5 * 60 * 1000; // 5 minutos
+
+const PERSONAL_STATE_CACHE = new Map();
+let personalStateHydrated = false;
+
 const MULTI_PC_CACHE = new Map();
 
 // ================= REDIS HELPERS =================
@@ -74,58 +84,68 @@ function hasLegendRole(member, legendRoleId) {
   return member.roles.cache.some((r) => r.name.trim().toLowerCase() === "legend");
 }
 
-async function isFarmModeActive(redis) {
+async function isFarmModeActive(redis, force = false) {
+  const now = Date.now();
+  if (!force && now - FARM_MODE_CACHE.ts < FARM_MODE_TTL) {
+    return FARM_MODE_CACHE.val;
+  }
   try {
     const val = await redis.get(FARM_MODE_KEY);
-    return val === "true" || val === true || val === 1 || val === "1";
+    const active = val === "true" || val === true || val === 1 || val === "1";
+    FARM_MODE_CACHE = { ts: now, val: active };
+    return active;
   } catch {
-    return false;
-  }
-}
-
-async function getActiveSharingUsers(redis) {
-  try {
-    const raw = await redis.get(SHARING_USERS_KEY);
-    return safeJsonParse(raw, {});
-  } catch {
-    return {};
+    return FARM_MODE_CACHE.val;
   }
 }
 
 async function setFarmMode(redis, enabled) {
   await redis.set(FARM_MODE_KEY, enabled ? "true" : "false");
+  FARM_MODE_CACHE = { ts: Date.now(), val: Boolean(enabled) };
 }
 
-async function getPersonalState(redis, discordId) {
+function defaultPersonalState() {
+  return {
+    channelId: null,
+    heartbeatMsgId: null,
+    offlineMsgId: null,
+    kickReasonMsgId: null,
+    wasOnline: false,
+    onlineSince: 0,
+    lastOnlineGroup: null,
+    lastHeartbeatAt: 0
+  };
+}
+
+async function hydratePersonalStates(redis) {
+  if (personalStateHydrated) return;
   try {
-    const raw = await redis.hget(PERSONAL_STATE_KEY, String(discordId));
-    return safeJsonParse(raw, {
-      channelId: null,
-      heartbeatMsgId: null,
-      offlineMsgId: null,
-      kickReasonMsgId: null,
-      wasOnline: false,
-      onlineSince: 0,
-      lastOnlineGroup: null,
-      lastHeartbeatAt: 0
-    });
-  } catch {
-    return {
-      channelId: null,
-      heartbeatMsgId: null,
-      offlineMsgId: null,
-      kickReasonMsgId: null,
-      wasOnline: false,
-      onlineSince: 0,
-      lastOnlineGroup: null,
-      lastHeartbeatAt: 0
-    };
+    const allRaw = await redis.hgetall(PERSONAL_STATE_KEY);
+    if (allRaw && typeof allRaw === "object") {
+      for (const [uid, raw] of Object.entries(allRaw)) {
+        PERSONAL_STATE_CACHE.set(String(uid), { ...defaultPersonalState(), ...safeJsonParse(raw, {}) });
+      }
+    }
+    personalStateHydrated = true;
+  } catch (err) {
+    console.error("Error hydrating personal states:", err);
   }
 }
 
+async function getPersonalState(redis, discordId) {
+  await hydratePersonalStates(redis);
+  const key = String(discordId);
+  if (!PERSONAL_STATE_CACHE.has(key)) {
+    PERSONAL_STATE_CACHE.set(key, defaultPersonalState());
+  }
+  return PERSONAL_STATE_CACHE.get(key);
+}
+
 async function savePersonalState(redis, discordId, state) {
+  const key = String(discordId);
+  PERSONAL_STATE_CACHE.set(key, state);
   try {
-    await redis.hset(PERSONAL_STATE_KEY, { [String(discordId)]: JSON.stringify(state) });
+    await redis.hset(PERSONAL_STATE_KEY, { [key]: JSON.stringify(state) });
   } catch (err) {
     console.error("Error saving personal state:", err);
   }
@@ -150,16 +170,26 @@ async function loadUsers(redis, group) {
   return users;
 }
 
-async function loadOnlineIDs(redis, group) {
+async function loadOnlineIDs(redis, group, force = false) {
+  const now = Date.now();
+  const cached = ONLINE_CACHE.get(group);
+  if (!force && cached && now - cached.ts < ONLINE_CACHE_TTL) return cached.data;
+
   const ids = await redis.smembers(onlineKey(group));
-  if (!Array.isArray(ids)) return [];
-  return ids.map(normalizeId).filter((x) => /^\d{16}$/.test(x));
+  const clean = Array.isArray(ids) ? ids.map(normalizeId).filter((x) => /^\d{16}$/.test(x)) : [];
+  ONLINE_CACHE.set(group, { ts: now, data: clean });
+  return clean;
 }
 
 async function removeOnlineIDs(redis, group, ids) {
   const cleanIds = ids.map(normalizeId).filter((x) => /^\d{16}$/.test(x));
   if (!cleanIds.length) return;
   await redis.srem(onlineKey(group), ...cleanIds);
+  const cached = ONLINE_CACHE.get(group);
+  if (cached) {
+    const removeSet = new Set(cleanIds);
+    cached.data = cached.data.filter((id) => !removeSet.has(id));
+  }
 }
 
 function getUserGameIds(userData) {
@@ -192,7 +222,7 @@ async function findUserByGameId(redis, GROUP_CONFIG, targetGameId) {
   return null;
 }
 
-// ================= HEARTBEAT PARSERS (HEADLESS MODE) =================
+// ================= HEARTBEAT PARSERS =================
 
 function getMessageText(message) {
   let content = message.content || "";
@@ -230,13 +260,15 @@ function parseSingleHeartbeat(content) {
     ? onlineMatch[1].split(",").map((x) => x.trim()).filter(Boolean)
     : [];
   const mainOnline = onlineRaw.some((x) => x.toLowerCase() === "main");
+  const activeNumericCount = onlineRaw.filter((x) => /^\d+$/.test(x)).length;
 
   return {
     time: timeMatch?.[1]?.trim() || "0m",
     packs: Number(packsMatch?.[1] || 0),
     ppm: Number(avgMatch?.[1] || 0),
     type: typeMatch?.[1]?.trim() || "Headless",
-    mainOnline
+    mainOnline,
+    activeNumericCount
   };
 }
 
@@ -276,6 +308,7 @@ function updateAndMergeUserMultiPC(discordId, rawHbName, registeredUserData, con
 
   let totalPacks = 0;
   let totalPPM = 0;
+  let totalNumericInstances = 0;
   let latestTime = parsed.time;
   let typeStr = parsed.type;
   let mainOnline = false;
@@ -284,6 +317,7 @@ function updateAndMergeUserMultiPC(discordId, rawHbName, registeredUserData, con
   for (const [, v] of userMap.entries()) {
     totalPacks += v.stats.packs;
     totalPPM += v.stats.ppm;
+    totalNumericInstances += v.stats.activeNumericCount;
     if (v.stats.time && v.stats.time !== "0m") latestTime = v.stats.time;
     if (v.stats.mainOnline) mainOnline = true;
     activeSources.push(v.rawName);
@@ -292,6 +326,7 @@ function updateAndMergeUserMultiPC(discordId, rawHbName, registeredUserData, con
   return {
     packs: totalPacks,
     ppm: Number(totalPPM.toFixed(2)),
+    activeNumericInstances: totalNumericInstances,
     time: latestTime,
     type: typeStr,
     mainOnline,
@@ -299,7 +334,7 @@ function updateAndMergeUserMultiPC(discordId, rawHbName, registeredUserData, con
   };
 }
 
-// ================= PERSONAL HEARTBEAT EMBED DESIGN (HEADLESS) =================
+// ================= PERSONAL HEARTBEAT EMBED DESIGN =================
 
 function buildPrettyHeartbeatEmbed({
   userData,
@@ -360,7 +395,7 @@ function buildPrettyHeartbeatEmbed({
     .setTimestamp();
 }
 
-// ================= PERSONAL CHANNEL MANAGEMENT & SILENT PERMISSIONS =================
+// ================= PERSONAL CHANNEL MANAGEMENT =================
 
 async function getOrCreatePersonalChannel({
   guild,
@@ -530,24 +565,25 @@ module.exports = (client, options) => {
     onFarmModeChanged
   } = options;
 
-  client.once("ready", () => {
-    console.log("✅ alerts.js 3.0 loaded (Headless Mode • No Instances/Duos • Accounts & Proxies Sharing)");
-    setInterval(scanOnlineStatusAndTimeouts, 3 * 60 * 1000);
+  client.once("ready", async () => {
+    console.log("✅ alerts.js 3.1 loaded (Low-Redis Optimized)");
+    await hydratePersonalStates(redis);
+    // Escaneo cada 5 minutos (en vez de 3 min)
+    setInterval(scanOnlineStatusAndTimeouts, 5 * 60 * 1000);
   });
 
   async function scanOnlineStatusAndTimeouts() {
     try {
+      await hydratePersonalStates(redis);
       const farmMode = await isFarmModeActive(redis);
-      const sharingUsers = await getActiveSharingUsers(redis);
       const now = Date.now();
       const guild = client.guilds.cache.first();
       if (!guild) return;
 
-      const allStatesRaw = await redis.hgetall(PERSONAL_STATE_KEY).catch(() => ({}));
       const currentlyOnlineUsers = new Map();
 
       for (const group of Object.keys(GROUP_CONFIG)) {
-        const onlineIds = await loadOnlineIDs(redis, group);
+        const onlineIds = await loadOnlineIDs(redis, group, true);
         const users = await loadUsers(redis, group);
         for (const [discordId, uData] of Object.entries(users)) {
           if (isUserOnlineInGroup(uData, onlineIds)) {
@@ -559,35 +595,32 @@ module.exports = (client, options) => {
         }
       }
 
-      // 1. Detect users who transitioned Online -> Offline
-      if (allStatesRaw && typeof allStatesRaw === "object") {
-        for (const [discordId, rawState] of Object.entries(allStatesRaw)) {
-          const state = safeJsonParse(rawState, null);
-          if (!state || !state.wasOnline) continue;
+      // 1. Detect users who transitioned Online -> Offline (usando caché en memoria)
+      for (const [discordId, state] of PERSONAL_STATE_CACHE.entries()) {
+        if (!state || !state.wasOnline) continue;
 
-          if (!currentlyOnlineUsers.has(String(discordId))) {
-            state.wasOnline = false;
-            const ch = state.channelId
-              ? guild.channels.cache.get(state.channelId) || (await guild.channels.fetch(state.channelId).catch(() => null))
-              : null;
+        if (!currentlyOnlineUsers.has(String(discordId))) {
+          state.wasOnline = false;
+          const ch = state.channelId
+            ? guild.channels.cache.get(state.channelId) || (await guild.channels.fetch(state.channelId).catch(() => null))
+            : null;
 
-            if (ch) {
-              const gLabel = (state.lastOnlineGroup || "Group").replace("_", " ");
-              await sendLastOfflineCard(ch, state, { name: state.userName || "Reroller" }, gLabel);
-            }
-            await savePersonalState(redis, discordId, state);
+          if (ch) {
+            const gLabel = (state.lastOnlineGroup || "Group").replace("_", " ");
+            await sendLastOfflineCard(ch, state, { name: state.userName || "Reroller" }, gLabel);
           }
+          await savePersonalState(redis, discordId, state);
         }
       }
 
-      // 2. Timeout de 40 min sin heartbeat (respetando usuarios en Sharing Accounts o Legend Sharing Proxies)
+      // 2. Timeout de 40 min sin heartbeat (respetando rol Legend)
       if (!farmMode) {
         for (const [discordId, info] of currentlyOnlineUsers.entries()) {
           const member =
             guild.members.cache.get(String(discordId)) ||
             (await guild.members.fetch(String(discordId)).catch(() => null));
 
-          if (sharingUsers[String(discordId)] || hasLegendRole(member, LEGEND_ROLE_ID)) {
+          if (hasLegendRole(member, LEGEND_ROLE_ID)) {
             continue;
           }
 
@@ -596,7 +629,6 @@ module.exports = (client, options) => {
             if (!state.onlineSince) {
               state.onlineSince = now;
               state.lastHeartbeatAt = now;
-              await savePersonalState(redis, discordId, state);
             }
             continue;
           }
@@ -702,7 +734,7 @@ module.exports = (client, options) => {
         return;
       }
 
-      // --- B. FARM MODE COMMANDS FOR CHAMPIONS (!farm on / !farm off / !farm status) ---
+      // --- B. FARM MODE COMMANDS FOR CHAMPIONS ---
       if (!message.author.bot && message.content) {
         const lower = message.content.trim().toLowerCase();
         if (lower === "!farm on" || lower === "!farm off" || lower === "!farm status") {
@@ -715,7 +747,7 @@ module.exports = (client, options) => {
           }
 
           if (lower === "!farm status") {
-            const active = await isFarmModeActive(redis);
+            const active = await isFarmModeActive(redis, true);
             return message.reply(
               active
                 ? "🌾 **Farm Mode is currently ACTIVE.** No users will be kicked for heartbeat timeouts."
@@ -777,7 +809,9 @@ module.exports = (client, options) => {
       const guild = message.guild;
       if (!guild) return;
 
-      const member = await guild.members.fetch(matchedDiscordId).catch(() => null);
+      const member =
+        guild.members.cache.get(matchedDiscordId) ||
+        (await guild.members.fetch(matchedDiscordId).catch(() => null));
       const state = await getPersonalState(redis, matchedDiscordId);
       const farmMode = await isFarmModeActive(redis);
 
@@ -792,10 +826,22 @@ module.exports = (client, options) => {
 
       if (!userChannel) return;
 
-      state.channelId = userChannel.id;
-      state.userName = matchedUserData.name || "Reroller";
+      let stateNeedsSave = false;
+      if (state.channelId !== userChannel.id) {
+        state.channelId = userChannel.id;
+        stateNeedsSave = true;
+      }
+      if (state.userName !== (matchedUserData.name || "Reroller")) {
+        state.userName = matchedUserData.name || "Reroller";
+        stateNeedsSave = true;
+      }
+      if (state.lastOnlineGroup !== group) {
+        state.lastOnlineGroup = group;
+        stateNeedsSave = true;
+      }
+
+      // Actualizado en memoria (no requiere escribir a Redis en cada heartbeat)
       state.lastHeartbeatAt = Date.now();
-      state.lastOnlineGroup = group;
 
       const onlineIds = await loadOnlineIDs(redis, group);
       const isCurrentlyOnline = isUserOnlineInGroup(matchedUserData, onlineIds);
@@ -803,15 +849,12 @@ module.exports = (client, options) => {
       if (isCurrentlyOnline) {
         if (!state.wasOnline) {
           state.onlineSince = Date.now();
+          state.wasOnline = true;
+          stateNeedsSave = true;
         }
-        state.wasOnline = true;
-        await clearTransientMessagesOnOnline(userChannel, state);
+        const cleared = await clearTransientMessagesOnOnline(userChannel, state);
+        if (cleared) stateNeedsSave = true;
       }
-
-      const sharingUsers = await getActiveSharingUsers(redis);
-      const isLegendProxy = hasLegendRole(member, LEGEND_ROLE_ID);
-      const isAccountSharing = Boolean(sharingUsers[String(matchedDiscordId)]?.type === "accounts");
-      const shareMode = isLegendProxy ? "proxies" : isAccountSharing ? "accounts" : null;
 
       const merged = updateAndMergeUserMultiPC(
         matchedDiscordId,
@@ -819,6 +862,10 @@ module.exports = (client, options) => {
         matchedUserData,
         content
       );
+
+      const isLegendProxy = hasLegendRole(member, LEGEND_ROLE_ID);
+      const isAccountSharing = !isLegendProxy && merged.ppm <= 0 && merged.activeNumericInstances === 0;
+      const shareMode = isLegendProxy ? "proxies" : isAccountSharing ? "accounts" : null;
 
       const prettyEmbed = buildPrettyHeartbeatEmbed({
         userData: matchedUserData,
@@ -845,13 +892,20 @@ module.exports = (client, options) => {
         if (existingBotHb) {
           await existingBotHb.edit({ content: "", embeds: [prettyEmbed] }).catch(() => {});
           state.heartbeatMsgId = existingBotHb.id;
+          stateNeedsSave = true;
         } else {
           const sent = await userChannel.send({ embeds: [prettyEmbed] }).catch(() => null);
-          if (sent) state.heartbeatMsgId = sent.id;
+          if (sent) {
+            state.heartbeatMsgId = sent.id;
+            stateNeedsSave = true;
+          }
         }
       }
 
-      await savePersonalState(redis, matchedDiscordId, state);
+      // Solo guardamos en Redis si hubo un cambio estructural real
+      if (stateNeedsSave) {
+        await savePersonalState(redis, matchedDiscordId, state);
+      }
     } catch (err) {
       console.error("🔥 Error in alerts.js:", err);
     }
